@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Editor Calendario FEAGA/FEADER (v1.2.8)
-Cambios clave v1.2.8:
-- Wrappers _mb_info/_mb_error que fuerzan los messagebox en primer plano (topmost) con parent correcto.
-- Botón "Mostrar pagos (día seleccionado)" siempre ejecuta, actualiza estado y muestra aviso cuando procede.
-- Se mantiene el FIX de v1.2.7 (creación de pay_frame antes que el calendario) y el índice solo para datos "reales".
+Editor Calendario FEAGA/FEADER (v1.3.0)
+Novedades v1.3.0:
+- AVISOS: popup modal propio (_popup_info/_popup_error) => siempre topmost y repetible.
+- ÍNDICE: pestaña "Índice" con tabla de todos los pagos importados (web/PDF), filtros por texto y por fechas.
+- Persistencia del índice: "Guardar índice…" y "Cargar índice…" (JSON).
+- Se mantiene: índice SOLO para datos reales; heurística separada; botón "Mostrar pagos" siempre actúa.
+
 Requisitos base:
     pip install pandas xlsxwriter
 Opcionales:
@@ -12,14 +14,15 @@ Opcionales:
 """
 
 import calendar
+import json
 import re
 import threading
 import traceback
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 import pandas as pd
 
 # -------------------- Utilidades --------------------
@@ -48,9 +51,17 @@ def daterange(d1: date, d2: date):
         yield cur
         cur += timedelta(days=1)
 
+def parse_ddmmyyyy(s: str) -> date | None:
+    s = s.strip()
+    if not s: return None
+    try:
+        return datetime.strptime(s, "%d/%m/%Y").date()
+    except Exception:
+        return None
+
 # -------------------- Índice de pagos (solo reales) --------------------
 class PaymentsIndex:
-    def __init__(self): self._by_date = {}
+    def __init__(self): self._by_date: dict[date, list[dict]] = {}
     def clear(self): self._by_date.clear()
     def add(self, dt: date, tipo: str, fondo: str, detalle: str, fuente: str = ""):
         self._by_date.setdefault(dt, []).append({"tipo":tipo,"fondo":fondo,"detalle":detalle,"fuente":fuente})
@@ -58,6 +69,31 @@ class PaymentsIndex:
         for dt in daterange(d1,d2): self.add(dt, **kwargs)
     def get_day(self, dt: date): return list(self._by_date.get(dt, []))
     def has_day(self, dt: date) -> bool: return bool(self._by_date.get(dt))
+    def iter_all(self):
+        for dt in sorted(self._by_date.keys()):
+            for it in self._by_date[dt]:
+                yield dt, it
+    # Persistencia JSON
+    def to_dict(self):
+        out={}
+        for dt, items in self._by_date.items():
+            out[dt.isoformat()] = items
+        return out
+    def from_dict(self, data: dict):
+        self._by_date.clear()
+        for k, items in data.items():
+            try:
+                dt = datetime.fromisoformat(k).date()
+            except Exception:
+                continue
+            self._by_date[dt] = list(items)
+    def save_json(self, path: Path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+    def load_json(self, path: Path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.from_dict(data)
 
 # -------------------- Heurística FEAGA --------------------
 class HeuristicPaymentsProvider:
@@ -95,7 +131,7 @@ class FegaWebScraper:
     def available(self): return self._ok
     def fetch_into_index(self, index: PaymentsIndex, year_hint:int|None=None):
         if not self._ok: raise RuntimeError("Falta 'requests'.")
-        import requests
+        import requests, re
         for url in self.NOTE_URLS:
             try:
                 r = requests.get(url, timeout=15)
@@ -204,7 +240,7 @@ class YearCalendarFrame(ttk.Frame):
         self.on_date_double_click = on_date_double_click
         self.has_events_predicate = has_events_predicate or (lambda y,m,d: False)
 
-        # Selección única global (inicial a hoy si coincide el año; si no, 1/1 del año visible)
+        # Selección única global
         if self.current_year == date.today().year:
             init = f"{self.current_year:04d}-{date.today().month:02d}-{date.today().day:02d}"
         else:
@@ -258,13 +294,9 @@ class YearCalendarFrame(ttk.Frame):
         ttk.Label(f,text=self.MESES_ES[month-1],font=("Segoe UI",9,"bold")).grid(row=0,column=0,columnspan=7,sticky="ew",pady=(0,2))
         for i,d in enumerate(self.DIAS):
             ttk.Label(f,text=d,style=("CalHeadWE.TLabel" if i in (5,6) else "CalHead.TLabel")).grid(row=1,column=i,padx=1,sticky="nsew")
-
         weeks=calendar.monthcalendar(year,month)
-        font_norm=("Segoe UI",9)
-        font_bold=("Segoe UI",9,"bold")
-        color_weekend="#b00000"
-        color_event="#084f8a"
-
+        font_norm=("Segoe UI",9); font_bold=("Segoe UI",9,"bold")
+        color_weekend="#b00000"; color_event="#084f8a"
         for r,week in enumerate(weeks,start=2):
             for c in range(7):
                 day=week[c]
@@ -281,7 +313,6 @@ class YearCalendarFrame(ttk.Frame):
                 rb.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
                 rb.bind("<ButtonRelease-1>", lambda e, v=val: self.sel_var.set(v))
                 rb.bind("<Double-Button-1>", lambda e,y=year,m=month,d=day:self._dbl(y,m,d))
-
         for c in range(7): f.columnconfigure(c,weight=1,uniform="d")
         f.grid_rowconfigure(0,minsize=18); f.grid_rowconfigure(1,minsize=18)
         for r in range(2,2+len(weeks)): f.grid_rowconfigure(r,weight=1,minsize=26)
@@ -291,7 +322,6 @@ class YearCalendarFrame(ttk.Frame):
     def go_to_date(self, dt: date):
         self._set(dt.year)
         self.sel_var.set(f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}")
-
     def get_selected_date(self):
         val=self.sel_var.get()
         if not val: return None
@@ -300,7 +330,6 @@ class YearCalendarFrame(ttk.Frame):
             return date(y,m,d)
         except Exception:
             return None
-
     def ensure_selection_in_current_year(self):
         val = self.sel_var.get()
         try:
@@ -327,12 +356,9 @@ class YearCalendarFrame(ttk.Frame):
             return
         self.info.config(text=f"Seleccionado: {d:02d}/{m:02d}/{y}  (clic=pagos · doble clic=insertar)")
         if callable(self.on_date_change): self.on_date_change(y,m,d)
-
     def _dbl(self,y,m,d):
         self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
         if callable(self.on_date_double_click): self.on_date_double_click(y,m,d)
-
-    # --- Navegación año
     def _set(self,year):
         try: year=int(year)
         except: year=self.current_year
@@ -385,44 +411,31 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self._remember_and_show(date.today())
         self._update_today_banner()
 
-    # -------- Messagebox wrappers (siempre en primer plano) --------
-    def _mb_info(self, title, message):
-        parent = self.winfo_toplevel()
+    # -------- Popup modal propio (repetible y topmost) --------
+    def _popup(self, title, message, error=False):
+        top = tk.Toplevel(self.winfo_toplevel())
+        top.title(title)
+        top.transient(self.winfo_toplevel())
+        try: top.attributes("-topmost", True)
+        except Exception: pass
+        top.grab_set()
+        frm = ttk.Frame(top, padding=12); frm.pack(fill="both", expand=True)
+        lbl = ttk.Label(frm, text=message, justify="left", foreground=("#b00000" if error else "#222"))
+        lbl.pack(fill="x", expand=True)
+        btn = ttk.Button(frm, text="OK", command=top.destroy)
+        btn.pack(pady=(10,0))
+        top.update_idletasks()
+        # centrar sobre la principal
         try:
-            parent.attributes("-topmost", True)
-        except Exception:
-            pass
-        try:
-            parent.bell()
-        except Exception:
-            pass
-        try:
-            messagebox.showinfo(title, message, parent=parent)
-        finally:
-            try:
-                parent.attributes("-topmost", False)
-            except Exception:
-                pass
+            px = self.winfo_rootx() + (self.winfo_width()//2 - top.winfo_width()//2)
+            py = self.winfo_rooty() + (self.winfo_height()//2 - top.winfo_height()//2)
+            top.geometry(f"+{max(0,px)}+{max(0,py)}")
+        except Exception: pass
+        top.wait_window(top)
+    def _popup_info(self, title, message): self._popup(title, message, error=False)
+    def _popup_error(self, title, message): self._popup(title, message, error=True)
 
-    def _mb_error(self, title, message):
-        parent = self.winfo_toplevel()
-        try:
-            parent.attributes("-topmost", True)
-        except Exception:
-            pass
-        try:
-            parent.bell()
-        except Exception:
-            pass
-        try:
-            messagebox.showerror(title, message, parent=parent)
-        finally:
-            try:
-                parent.attributes("-topmost", False)
-            except Exception:
-                pass
-
-    # ---- Datos tabla
+    # ---- Datos tabla (izquierda)
     def _build_dataset(self):
         data = {
             "Mes":[
@@ -441,7 +454,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 "- Notificación de resultados de controles a los beneficiarios.\n- Periodo para presentar alegaciones y documentación adicional.\n- Ajustes finales en los expedientes antes de la resolución.",
                 "- A partir del 16 de octubre: Inicio de pagos de anticipos de las ayudas directas (hasta el 70%).\n- Publicación de resoluciones provisionales de ayudas.\n- Inicio de pagos de ciertas medidas FEADER que lo permitan.",
                 "- Continuación de los pagos de anticipos.\n- Actualización y cierre de expedientes administrativos.\n- Preparación de resoluciones definitivas.",
-                "- 31 de diciembre: Fecha límite para realizar ciertos pagos nacionales.\n- Finalización de trámites administrativos pendientes.\n- Planificación de la próxima campaña PAC.",
+                "- 31 de diciembre: Fecha límite para realizar ciertos pagos nacionales.\n- Finalización de trámites administrativas pendientes.\n- Planificación de la próxima campaña PAC.",
                 "- Pagos finales de las ayudas directas hasta el 30 de junio del año siguiente al de la solicitud.\n- Resolución de incidencias y recursos.\n- Desarrollo y ejecución de proyectos FEADER aprobados en convocatorias anteriores.",
                 "- Desarrollo y ejecución de proyectos FEADER según la programación de Aragón en el PEPAC 2023-2027.\n- Convocatorias específicas de medidas de desarrollo rural (modernización, inversiones, agroambiente, clima, LEADER, etc.).\n- Asesoramiento y formación a agricultores y ganaderos sobre prácticas sostenibles y requisitos normativos.\n- Seguimiento y evaluación de proyectos en curso."
             ],
@@ -470,7 +483,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tk.Button(self.alert_bar, text="X", command=lambda:self.alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
         self.alert_bar.pack_forget()
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.8)",
+        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.3.0)",
                   font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
 
         split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
@@ -498,7 +511,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         right=ttk.Frame(split); split.add(right, weight=2)
         self.tabs=ttk.Notebook(right); self.tabs.pack(fill="both", expand=True)
 
-        # Actividad
+        # --- Actividad
         tab_act=ttk.Frame(self.tabs); self.tabs.add(tab_act,text="Actividad")
         ttk.Label(tab_act,text="Vista/Edición rápida de 'Actividad':").grid(row=0,column=0,columnspan=3,sticky="w")
         tf=ttk.Frame(tab_act); tf.grid(row=1,column=0,columnspan=3,sticky="nsew",pady=(4,0))
@@ -518,7 +531,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         for i in (0,1): btns.grid_columnconfigure(i,weight=1)
         tab_act.rowconfigure(1,weight=1); tab_act.columnconfigure(0,weight=1)
 
-        # Calendario
+        # --- Calendario
         tab_cal=ttk.Frame(self.tabs); self.tabs.add(tab_cal,text="Calendario")
         v_split=ttk.Panedwindow(tab_cal,orient="vertical"); v_split.pack(fill="both", expand=True)
 
@@ -542,14 +555,72 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         ttk.Button(tools,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")
         ttk.Button(tools,text="Importar circulares (PDF)…",command=self._import_pdfs).pack(side="left",padx=(6,0))
         ttk.Button(tools,text="Mostrar pagos (día seleccionado)",command=self._show_selected_date_payments).pack(side="left",padx=(6,0))
-        ttk.Button(tools,text="Vaciar pagos (mantener heurística)",command=self._reset_index_only).pack(side="right")
+        ttk.Button(tools,text="Guardar índice…",command=self._save_index).pack(side="right")
+        ttk.Button(tools,text="Cargar índice…",command=self._load_index).pack(side="right",padx=(6,0))
+        ttk.Button(tools,text="Vaciar pagos (mantener heurística)",command=self._reset_index_only).pack(side="right",padx=(6,0))
 
         try:
             v_split.paneconfigure(cal_holder,minsize=140); v_split.paneconfigure(self.pay_frame,minsize=100)
         except Exception: pass
 
+        # --- Índice (pestaña nueva)
+        tab_idx=ttk.Frame(self.tabs); self.tabs.add(tab_idx,text="Índice")
+        self._build_index_tab(tab_idx)
+
+        # binds
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", self._on_double_click_cell)
+
+    # ---- Pestaña "Índice"
+    def _build_index_tab(self, parent):
+        top=ttk.Frame(parent); top.pack(fill="x", pady=(6,4))
+        ttk.Label(top, text="Filtro texto:").pack(side="left", padx=(6,4))
+        self.idx_filter_txt = ttk.Entry(top, width=30); self.idx_filter_txt.pack(side="left", padx=(0,10))
+        ttk.Label(top, text="Desde (dd/mm/aaaa):").pack(side="left")
+        self.idx_from = ttk.Entry(top, width=12); self.idx_from.pack(side="left", padx=(4,10))
+        ttk.Label(top, text="Hasta:").pack(side="left")
+        self.idx_to = ttk.Entry(top, width=12); self.idx_to.pack(side="left", padx=(4,10))
+        ttk.Button(top, text="Refrescar", command=self._refresh_index_tab).pack(side="left")
+        ttk.Button(top, text="Ir a día", command=self._goto_from_index_tab).pack(side="left", padx=(10,0))
+
+        cols=("fecha","tipo","fondo","detalle","fuente")
+        self.idx_tree=ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
+        headers={"fecha":(90,"w"),"tipo":(180,"w"),"fondo":(80,"w"),"detalle":(600,"w"),"fuente":(240,"w")}
+        for c,(w,anc) in headers.items():
+            self.idx_tree.heading(c, text=c.capitalize()); self.idx_tree.column(c, width=w, anchor=anc, stretch=True)
+        self.idx_tree.pack(fill="both", expand=True, padx=6, pady=(0,6))
+        ysb=ttk.Scrollbar(parent, orient="vertical", command=self.idx_tree.yview)
+        self.idx_tree.configure(yscrollcommand=ysb.set)
+        ysb.place(in_=self.idx_tree, relx=1.0, rely=0, relheight=1.0, x=-16)
+
+        self._refresh_index_tab()
+
+    def _refresh_index_tab(self):
+        txt = self.idx_filter_txt.get().strip().lower()
+        d1 = parse_ddmmyyyy(self.idx_from.get()) if self.idx_from.get().strip() else None
+        d2 = parse_ddmmyyyy(self.idx_to.get()) if self.idx_to.get().strip() else None
+        self.idx_tree.delete(*self.idx_tree.get_children())
+        for dt, it in self.index.iter_all():
+            if d1 and dt < d1: continue
+            if d2 and dt > d2: continue
+            blob = f"{it.get('tipo','')} {it.get('fondo','')} {it.get('detalle','')} {it.get('fuente','')}".lower()
+            if txt and txt not in blob: continue
+            self.idx_tree.insert("", "end", values=(dt.strftime("%d/%m/%Y"), it["tipo"], it["fondo"], it["detalle"], it.get("fuente","")))
+
+    def _goto_from_index_tab(self):
+        sel = self.idx_tree.selection()
+        if not sel:
+            self._popup_info("Índice", "Selecciona primero una fila del índice.")
+            return
+        vals = self.idx_tree.item(sel[0], "values")
+        try:
+            dt = datetime.strptime(vals[0], "%d/%m/%Y").date()
+        except Exception:
+            self._popup_error("Índice", "No se pudo interpretar la fecha seleccionada.")
+            return
+        self.tabs.select(1)  # pestaña "Calendario" (0=Actividad, 1=Calendario, 2=Índice)
+        self.yearcal.go_to_date(dt)
+        self._remember_and_show(dt)
 
     # ---- avisos "hoy"
     def _effective_today_items(self):
@@ -561,7 +632,6 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             if key in seen: continue
             seen.add(key); out.append(it)
         return out
-
     def _update_today_banner(self):
         items=self._effective_today_items()
         if items:
@@ -573,12 +643,10 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 self.alert_bar.pack_forget()
         else:
             self.alert_bar.pack_forget()
-
     def _select_calendar_tab(self):
         for i in range(self.tabs.index("end")):
             if self.tabs.tab(i,"text")=="Calendario":
                 self.tabs.select(i); break
-
     def _open_today(self):
         self._select_calendar_tab()
         self.yearcal.go_to_date(date.today())
@@ -591,12 +659,12 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 sc=FegaWebScraper()
                 if not sc.available(): raise RuntimeError("Falta 'requests'.")
                 sc.fetch_into_index(self.index, year_hint=date.today().year)
-                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(),
-                                      self._mb_info("Listo","Pagos actualizados desde FEGA (web).")))
+                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(), self._refresh_index_tab(),
+                                      self._popup_info("Listo","Pagos actualizados desde FEGA (web).")))
             except Exception as ex:
-                self.after(0, lambda: self._mb_error("Error", f"No se pudo completar el scraping web:\n{ex}"))
+                self.after(0, lambda: self._popup_error("Error", f"No se pudo completar el scraping web:\n{ex}"))
         threading.Thread(target=run, daemon=True).start()
-        self._mb_info("Actualizando","Buscando ventanas en notas FEGA…")
+        self._popup_info("Actualizando","Buscando ventanas en notas FEGA…")
 
     def _import_pdfs(self):
         folder=filedialog.askdirectory(title="Selecciona la carpeta con las circulares FEGA (PDF)")
@@ -606,22 +674,42 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 ing=FegaPDFIngestor()
                 if not ing.available(): raise RuntimeError("Falta 'PyPDF2'.")
                 ing.ingest_folder(Path(folder), self.index, default_year=date.today().year)
-                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(),
-                                      self._mb_info("Listo",f"Se importaron PDFs de {folder}")))
+                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(), self._refresh_index_tab(),
+                                      self._popup_info("Listo",f"Se importaron PDFs de {folder}")))
             except Exception as ex:
-                self.after(0, lambda: self._mb_error("Error", f"No se pudieron importar los PDFs:\n{ex}"))
+                self.after(0, lambda: self._popup_error("Error", f"No se pudieron importar los PDFs:\n{ex}"))
         threading.Thread(target=run, daemon=True).start()
-        self._mb_info("Importando","Leyendo circulares PDF…")
+        self._popup_info("Importando","Leyendo circulares PDF…")
+
+    def _save_index(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")],
+                                            title="Guardar índice de pagos", initialfile="indice_pagos.json")
+        if not path: return
+        try:
+            self.index.save_json(Path(path))
+            self._popup_info("Índice", f"Índice guardado en:\n{path}")
+        except Exception as ex:
+            self._popup_error("Índice", f"No se pudo guardar el índice:\n{ex}")
+
+    def _load_index(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")],
+                                          title="Cargar índice de pagos")
+        if not path: return
+        try:
+            self.index.load_json(Path(path))
+            self.yearcal.refresh(); self._update_today_banner(); self._refresh_index_tab()
+            self._popup_info("Índice", f"Índice cargado desde:\n{path}")
+        except Exception as ex:
+            self._popup_error("Índice", f"No se pudo cargar el índice:\n{ex}")
 
     def _reset_index_only(self):
         self.index.clear()
-        self.yearcal.refresh(); self._update_today_banner()
-        self._mb_info("Pagos","Índice vaciado. Se mantiene la heurística (no persistente).")
+        self.yearcal.refresh(); self._update_today_banner(); self._refresh_index_tab()
+        self._popup_info("Pagos","Índice vaciado. Se mantiene la heurística (no persistente).")
 
     # ---- Integración calendario -> mini-frame
     def _on_calendar_change(self,y,m,d):
         self._remember_and_show(date(y,m,d))
-
     def _remember_and_show(self, dt: date):
         self.current_selected_date = dt
         items = self.index.get_day(dt) + self.heur.get_for_day(dt)
@@ -637,23 +725,21 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             self.yearcal.ensure_selection_in_current_year()
             dt = self.yearcal.get_selected_date() or self.current_selected_date
             if not dt:
-                self._mb_info("Calendario","Selecciona primero un día del calendario.")
+                self._popup_info("Calendario","Selecciona primero un día del calendario.")
                 self.status_lbl.config(text="Sin selección")
                 return
-
             real = self.index.get_day(dt)
             heur = self.heur.get_for_day(dt)
             only_none = (not real) and len(heur)==1 and heur[0]["tipo"]=="Sin pagos FEAGA generales"
-
             if only_none:
-                self._mb_info("Pagos", f"No hay pagos para la fecha seleccionada ({dt.strftime('%d/%m/%Y')}).")
+                self._popup_info("Pagos", f"No hay pagos para la fecha seleccionada ({dt.strftime('%d/%m/%Y')}).")
             elif not real:
-                self._mb_info("Pagos", f"No hay pagos concretos indexados para {dt.strftime('%d/%m/%Y')}.\nSe muestran referencias heurísticas generales.")
-
+                self._popup_info("Pagos", f"No hay pagos concretos indexados para {dt.strftime('%d/%m/%Y')}.\nSe muestran referencias heurísticas generales.")
+            # Refresca mini-frame SIEMPRE
             self._remember_and_show(dt)
             self.status_lbl.config(text=f"Mostrado {dt.strftime('%d/%m/%Y')} (reales={len(real)})")
         except Exception:
-            self._mb_error("Error en botón", traceback.format_exc())
+            self._popup_error("Error en botón", traceback.format_exc())
             self.status_lbl.config(text="Error al mostrar")
 
     def _insert_date_in_activity(self,y,m,d):
@@ -672,7 +758,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self.activity_text.delete("1.0","end"); self.activity_text.insert("1.0", vals[1])
     def edit_selected_modal(self):
         it=self._get_selected_item()
-        if not it: self._mb_info("Editar fila","Selecciona primero una fila."); return
+        if not it: self._popup_info("Editar fila","Selecciona primero una fila."); return
         vals=list(self.tree.item(it,"values"))
         win=tk.Toplevel(self); win.title("Editar fila"); win.transient(self.winfo_toplevel()); win.grab_set()
         ttk.Label(win,text="Mes:").grid(row=0,column=0,sticky="w",padx=6,pady=(8,2))
@@ -705,16 +791,16 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         e.bind("<Return>",save); e.bind("<Escape>",lambda _ :top.destroy()); e.bind("<FocusOut>",save)
     def apply_activity_to_selected(self):
         it=self._get_selected_item()
-        if not it: self._mb_info("Aplicar","Selecciona primero una fila."); return
+        if not it: self._popup_info("Aplicar","Selecciona primero una fila."); return
         vals=list(self.tree.item(it,"values")); vals[1]=self.activity_text.get("1.0","end").rstrip("\n")
-        self.tree.item(it,values=vals); self._mb_info("Aplicar","Actividad actualizada.")
+        self.tree.item(it,values=vals); self._popup_info("Aplicar","Actividad actualizada.")
     def add_row(self):
         self.tree.insert("", "end", values=["","","",""])
         children=self.tree.get_children()
         if children: self.tree.selection_set(children[-1]); self.tree.see(children[-1])
     def delete_selected(self):
         it=self._get_selected_item()
-        if not it: self._mb_info("Eliminar fila","Selecciona primero una fila."); return
+        if not it: self._popup_info("Eliminar fila","Selecciona primero una fila."); return
         self.tree.delete(it); self.activity_text.delete("1.0","end")
     def export_to_excel(self):
         df=self._df_from_tree()
@@ -730,11 +816,11 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 ws.set_column(f'{col}:{col}',50,fmt)
                 for i,row in df.iterrows():
                     ws.set_row(i+1, 15*(str(row['Actividad']).count('\n')+1))
-            self._mb_info("Exportación completada", f"Archivo guardado en:\n{path}")
+            self._popup_info("Exportación completada", f"Archivo guardado en:\n{path}")
         except Exception as ex:
-            self._mb_error("Error al exportar", f"No se pudo exportar el Excel.\n\nDetalle: {ex}")
+            self._popup_error("Error al exportar", f"No se pudo exportar el Excel.\n\nDetalle: {ex}")
     def reset_data(self):
-        if messagebox.askyesno("Restablecer","¿Restablecer los datos originales?", parent=self.winfo_toplevel()):
+        if tk.messagebox.askyesno("Restablecer","¿Restablecer los datos originales?", parent=self.winfo_toplevel()):
             self._build_dataset(); self._load_into_tree(self.df); self.activity_text.delete("1.0","end")
     def _df_from_tree(self)->pd.DataFrame:
         return pd.DataFrame([self.tree.item(i,"values") for i in self.tree.get_children()], columns=self.columns)
@@ -750,8 +836,8 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Editor Calendario FEAGA/FEADER (v1.2.8)")
-    root.geometry("1280x820")
+    root.title("Editor Calendario FEAGA/FEADER (v1.3.0)")
+    root.geometry("1280x860")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
     except Exception: pass
