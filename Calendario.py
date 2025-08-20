@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Editor Calendario FEAGA/FEADER (v0.9)
-- FIX definitivo: selección robusta de días entre meses/años.
-  * Cada botón de día usa 'command=' y llama a YearCalendarFrame.select_date(y,m,d).
-  * Se guarda y resalta el día seleccionado (estilos CalSelected/CalSelectedWE).
-  * Tras cambiar de año, se re-dibuja y se re-aplica el highlight del día seleccionado.
-  * El mini-frame de pagos se repinta SIEMPRE en cada selección.
-- Resto: scraping/ingestor opcionales, heurística FEAGA, aviso "Pagos de hoy", exportación a Excel, edición, etc.
+Editor Calendario FEAGA/FEADER (v1.0)
+- FIX definitivo: selección robusta entre meses/años usando ttk.Radiobutton (indicator=0)
+  con una única StringVar. Cada cambio actualiza SIEMPRE el mini-frame de pagos.
+- Aviso de pagos de hoy, scraping opcional, importación de PDFs, exportación a Excel,
+  edición de la tabla de actividades.
 
 Requisitos base:
-  pip install pandas xlsxwriter
-Opcionales:
-  pip install requests beautifulsoup4 PyPDF2
+    pip install pandas xlsxwriter
+Opcionales para enriquecer:
+    pip install requests PyPDF2
 """
 
-import calendar, re, threading
+import calendar
+import re
+import threading
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -22,7 +22,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 
-# -------------------- Utilidades --------------------
+# ==============================
+# Utilidades de fechas/texto
+# ==============================
 SPANISH_MONTHS = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
     "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
@@ -49,7 +51,9 @@ def daterange(d1: date, d2: date):
         yield cur
         cur += timedelta(days=1)
 
-# -------------------- Índice de pagos --------------------
+# ==============================
+# Índice de pagos
+# ==============================
 class PaymentsIndex:
     def __init__(self): self._by_date = {}
     def clear(self): self._by_date.clear()
@@ -60,7 +64,9 @@ class PaymentsIndex:
     def get_day(self, dt: date): return list(self._by_date.get(dt, []))
     def has_day(self, dt: date) -> bool: return dt in self._by_date
 
-# -------------------- Heurística FEAGA --------------------
+# ==============================
+# Heurística FEAGA
+# ==============================
 class HeuristicPaymentsProvider:
     def get_for_day(self, dt: date):
         y, m = dt.year, dt.month
@@ -86,7 +92,9 @@ class HeuristicPaymentsProvider:
         return (date(campaign_year,10,16), date(campaign_year,11,30),
                 date(campaign_year,12,1), date(campaign_year+1,6,30))
 
-# -------------------- Scraper / Ingestor opcionales --------------------
+# ==============================
+# Scraper / Ingestor (opcionales)
+# ==============================
 class FegaWebScraper:
     NOTE_URLS = [
         "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf",
@@ -146,6 +154,7 @@ class FegaPDFIngestor:
             if not text: continue
             m = re.search(r"(20\d{2})", text)
             y = int(m.group(1)) if m else (default_year or date.today().year)
+
             for mo in re.finditer(r"del\s+(\d{1,2})\s+al\s+(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)", text):
                 d1,d2,mes = int(mo.group(1)), int(mo.group(2)), SPANISH_MONTHS[mo.group(3)]
                 ctx = text[max(0,mo.start()-120):mo.end()+120]
@@ -167,7 +176,9 @@ class FegaPDFIngestor:
                     index.add(date(y,mes,d), tipo=etiqueta, fondo=fondo,
                               detalle=f"Fecha mencionada en {pdf.name}", fuente=str(pdf))
 
-# -------------------- ScrollFrame --------------------
+# ==============================
+# Scroll contenedor
+# ==============================
 class VerticalScrolledFrame(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -196,23 +207,23 @@ class VerticalScrolledFrame(ttk.Frame):
             else: self.canvas.yview_scroll(int(-ev.delta/40),"units")
         except Exception: pass
 
-# -------------------- Calendario anual con selección robusta --------------------
+# ==============================
+# Calendario anual (Radiobuttons)
+# ==============================
 class YearCalendarFrame(ttk.Frame):
     MESES_ES=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
     DIAS=["L","M","X","J","V","S","D"]
 
-    def __init__(self, master, year=None, on_date_click=None, on_date_double_click=None, has_events_predicate=None):
+    def __init__(self, master, year=None, on_date_change=None, on_date_double_click=None, has_events_predicate=None):
         super().__init__(master)
         calendar.setfirstweekday(calendar.MONDAY)
         self.current_year = year or date.today().year
-        self.on_date_click = on_date_click
+        self.on_date_change = on_date_change
         self.on_date_double_click = on_date_double_click
         self.has_events_predicate = has_events_predicate or (lambda y,m,d: False)
 
-        # estado de selección y mapas de botones -> fecha/estilo
-        self.selected_dt: date | None = None
-        self._btn_map = {}          # (y,m,d) -> button
-        self._btn_style = {}        # (y,m,d) -> style original
+        # Variable de selección única en todo el calendario
+        self.sel_var = tk.StringVar(value="")
 
         self._styles(); self._controls()
 
@@ -223,14 +234,10 @@ class YearCalendarFrame(ttk.Frame):
 
     def _styles(self):
         st=ttk.Style(self)
-        st.configure("CalDay.TButton", padding=(1,1), font=("Segoe UI",9))
-        st.configure("CalWeekend.TButton", padding=(1,1), font=("Segoe UI",9), foreground="#b00000")
-        st.configure("CalEvent.TButton", padding=(1,1), font=("Segoe UI",9,"bold"), foreground="#084f8a")
-        st.configure("CalEventWE.TButton", padding=(1,1), font=("Segoe UI",9,"bold"), foreground="#b00000")
-        # seleccionados: mismo color pero con relieve y negrita
-        st.configure("CalSelected.TButton", padding=(1,1), font=("Segoe UI",9,"bold"), relief="sunken")
-        st.configure("CalSelectedWE.TButton", padding=(1,1), font=("Segoe UI",9,"bold"), foreground="#b00000", relief="sunken")
-
+        st.configure("CalDay.TRadiobutton", padding=(1,1), font=("Segoe UI",9))
+        st.configure("CalWeekend.TRadiobutton", padding=(1,1), font=("Segoe UI",9), foreground="#b00000")
+        st.configure("CalEvent.TRadiobutton", padding=(1,1), font=("Segoe UI",9,"bold"), foreground="#084f8a")
+        st.configure("CalEventWE.TRadiobutton", padding=(1,1), font=("Segoe UI",9,"bold"), foreground="#b00000")
         st.configure("CalHead.TLabel", padding=(0,0), font=("Segoe UI",9))
         st.configure("CalHeadWE.TLabel", padding=(0,0), font=("Segoe UI",9), foreground="#b00000")
 
@@ -247,25 +254,10 @@ class YearCalendarFrame(ttk.Frame):
         ttk.Button(top,text="Hoy",command=self._go_today).grid(row=0,column=3)
         self.info=ttk.Label(top,text="(clic=pagos · doble clic=insertar)"); self.info.grid(row=0,column=5,sticky="e")
 
-    # --------- API pública de selección ----------
-    def select_date(self, y:int, m:int, d:int):
-        """Selecciona un día: resalta, guarda estado y dispara callback."""
-        self._apply_selection_visual(y,m,d)
-        self.info.config(text=f"Seleccionado: {d:02d}/{m:02d}/{y}  (clic=pagos · doble clic=insertar)")
-        if callable(self.on_date_click):
-            self.on_date_click(y,m,d)
-
-    def go_to_date(self, dt: date):
-        self._set(dt.year)
-        self.select_date(dt.year, dt.month, dt.day)
-
-    # --------- construcción del grid ----------
-    def refresh(self):
-        self._grid_year()
+    def refresh(self): self._grid_year()
 
     def _grid_year(self):
         for ch in self.scroll.inner.winfo_children(): ch.destroy()
-        self._btn_map.clear(); self._btn_style.clear()
 
         grid=ttk.Frame(self.scroll.inner); grid.grid(row=0,column=0,sticky="nsew")
         for r in range(4): grid.rowconfigure(r,weight=1,uniform="m")
@@ -277,68 +269,63 @@ class YearCalendarFrame(ttk.Frame):
 
         self.scroll.inner.rowconfigure(0,weight=1); self.scroll.inner.columnconfigure(0,weight=1)
 
-        # Si había un día seleccionado del mismo año, re-aplica highlight
-        if self.selected_dt and self.selected_dt.year == self.current_year:
-            y,m,d = self.selected_dt.year, self.selected_dt.month, self.selected_dt.day
-            self._apply_selection_visual(y,m,d, update_only=True)
+        # Si ya había una fecha seleccionada (mismo año), el radiobutton correcto quedará marcado
+        self._notify_change()  # asegura que el panel de pagos está alineado con la selección actual
 
     def _month(self,parent,year,month):
         f=ttk.Frame(parent,borderwidth=1,relief="solid",padding=(4,3,4,4))
         ttk.Label(f,text=self.MESES_ES[month-1],font=("Segoe UI",9,"bold")).grid(row=0,column=0,columnspan=7,sticky="ew",pady=(0,2))
         for i,d in enumerate(self.DIAS):
             ttk.Label(f,text=d,style=("CalHeadWE.TLabel" if i in (5,6) else "CalHead.TLabel")).grid(row=1,column=i,padx=1,sticky="nsew")
+
         weeks=calendar.monthcalendar(year,month)
         for r,week in enumerate(weeks,start=2):
             for c in range(7):
                 day=week[c]
                 if day==0:
                     ttk.Label(f,text="").grid(row=r,column=c,padx=1,pady=1,sticky="nsew"); continue
+
                 has=self.has_events_predicate(year,month,day)
-                style=("CalEventWE.TButton" if has and c in (5,6) else
-                       "CalWeekend.TButton" if c in (5,6) else
-                       "CalEvent.TButton" if has else "CalDay.TButton")
-                btn=ttk.Button(f,text=str(day),style=style,
-                               command=lambda y=year,m=month,d=day:self.select_date(y,m,d))
-                btn.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
-                btn.bind("<Double-Button-1>", lambda e, y=year,m=month,d=day: self._dbl(y,m,d))
-                self._btn_map[(year,month,day)] = btn
-                self._btn_style[(year,month,day)] = style
+                style=("CalEventWE.TRadiobutton" if has and c in (5,6) else
+                       "CalWeekend.TRadiobutton" if c in (5,6) else
+                       "CalEvent.TRadiobutton" if has else "CalDay.TRadiobutton")
+
+                val=f"{year:04d}-{month:02d}-{day:02d}"
+                rb=ttk.Radiobutton(
+                    f, text=str(day), value=val, variable=self.sel_var,
+                    command=self._notify_change, style=style
+                )
+                # aspecto botón
+                rb.configure(takefocus=False)
+                rb.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
+                rb.bind("<Double-Button-1>", lambda e,y=year,m=month,d=day:self._dbl(y,m,d))
+
         for c in range(7): f.columnconfigure(c,weight=1,uniform="d")
         f.grid_rowconfigure(0,minsize=18); f.grid_rowconfigure(1,minsize=18)
         for r in range(2,2+len(weeks)): f.grid_rowconfigure(r,weight=1,minsize=26)
         return f
 
-    # --------- visual de selección ----------
-    def _apply_selection_visual(self, y:int, m:int, d:int, update_only:bool=False):
-        # Limpia el anterior
-        if self.selected_dt:
-            prev=(self.selected_dt.year,self.selected_dt.month,self.selected_dt.day)
-            btn_prev = self._btn_map.get(prev)
-            if btn_prev:
-                style_prev = self._btn_style.get(prev, "CalDay.TButton")
-                btn_prev.configure(style=style_prev)
+    # --- API pública
+    def go_to_date(self, dt: date):
+        self._set(dt.year)
+        self.sel_var.set(f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}")
+        self._notify_change()
 
-        # Guarda nuevo seleccionado
-        self.selected_dt = date(y,m,d)
+    # --- Eventos
+    def _notify_change(self):
+        val=self.sel_var.get()
+        if not val: return
+        y,m,d = map(int, val.split("-"))
+        self.info.config(text=f"Seleccionado: {d:02d}/{m:02d}/{y}  (clic=pagos · doble clic=insertar)")
+        if callable(self.on_date_change): self.on_date_change(y,m,d)
 
-        # Si sólo estamos actualizando tras un refresh y aún no existe el botón, salir
-        key=(y,m,d)
-        btn = self._btn_map.get(key)
-        if not btn: return
-
-        # Aplica estilo "seleccionado"
-        # Si el día original era fin de semana, usa estilo WE
-        orig_style = self._btn_style.get(key, "CalDay.TButton")
-        sel_style = "CalSelectedWE.TButton" if "Weekend" in orig_style or "WE" in orig_style else "CalSelected.TButton"
-        btn.configure(style=sel_style)
-
-    # --------- eventos ----------
     def _dbl(self,y,m,d):
-        # Propaga el clic (garantiza mini-frame actualizado) y, además, envía el doble clic para insertar
-        self.select_date(y,m,d)
+        # asegura que hay selección
+        self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
+        self._notify_change()
         if callable(self.on_date_double_click): self.on_date_double_click(y,m,d)
 
-    # --------- navegación ----------
+    # --- Navegación año
     def _set(self,year):
         try: year=int(year)
         except: year=self.current_year
@@ -348,7 +335,9 @@ class YearCalendarFrame(ttk.Frame):
     def _next(self): self._set(self.current_year+1)
     def _go_today(self): self.go_to_date(date.today())
 
-# -------------------- Pagos (Treeview) --------------------
+# ==============================
+# Mini-frame de pagos
+# ==============================
 class PaymentsInfoFrame(ttk.Frame):
     def __init__(self, master):
         super().__init__(master,padding=(6,4,6,4))
@@ -374,7 +363,9 @@ class PaymentsInfoFrame(ttk.Frame):
             self.tree.insert("", "end", values=(it["tipo"], it["fondo"], it["detalle"], it.get("fuente","")))
         self.update_idletasks()
 
-# -------------------- App principal --------------------
+# ==============================
+# App principal
+# ==============================
 class CalendarioFEAGA_FEADERFrame(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
@@ -432,7 +423,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tk.Button(self.alert_bar, text="X", command=lambda:self.alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
         self.alert_bar.pack_forget()
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v0.9)",
+        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.0)",
                   font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
 
         split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
@@ -483,7 +474,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         cal_holder=ttk.Frame(v_split); v_split.add(cal_holder,weight=3)
         self.yearcal=YearCalendarFrame(
             cal_holder, year=date.today().year,
-            on_date_click=self._on_calendar_click,
+            on_date_change=self._on_calendar_change,
             on_date_double_click=self._insert_date_in_activity,
             has_events_predicate=lambda y,m,d: self.index.has_day(date(y,m,d))
         )
@@ -535,16 +526,17 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 
     def _open_today(self):
         self._select_calendar_tab()
-        today=date.today()
-        self.yearcal.go_to_date(today)   # esto ya llama select_date -> on_date_click -> mini-frame
+        self.yearcal.go_to_date(date.today())
 
+    # ---- Carga desde FEGA (web/PDF)
     def _update_from_web(self):
         def run():
             try:
                 sc=FegaWebScraper()
                 if not sc.available(): raise RuntimeError("Falta 'requests'.")
                 sc.fetch_into_index(self.index, year_hint=date.today().year)
-                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(), messagebox.showinfo("Listo","Pagos actualizados desde FEGA (web).")))
+                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(),
+                                      messagebox.showinfo("Listo","Pagos actualizados desde FEGA (web).")))
             except Exception as ex:
                 self.after(0, lambda: messagebox.showerror("Error", f"No se pudo completar el scraping web: {ex}"))
         threading.Thread(target=run, daemon=True).start()
@@ -558,7 +550,8 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 ing=FegaPDFIngestor()
                 if not ing.available(): raise RuntimeError("Falta 'PyPDF2'.")
                 ing.ingest_folder(Path(folder), self.index, default_year=date.today().year)
-                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(), messagebox.showinfo("Listo",f"Se importaron PDFs de {folder}")))
+                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(),
+                                      messagebox.showinfo("Listo",f"Se importaron PDFs de {folder}")))
             except Exception as ex:
                 self.after(0, lambda: messagebox.showerror("Error", f"No se pudieron importar los PDFs: {ex}"))
         threading.Thread(target=run, daemon=True).start()
@@ -569,11 +562,11 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self.yearcal.refresh(); self._update_today_banner()
         messagebox.showinfo("Pagos","Índice reiniciado (sólo heurística).")
 
-    # ---- integración calendario
-    def _on_calendar_click(self,y,m,d):
+    # ---- Integración calendario -> mini-frame
+    def _on_calendar_change(self,y,m,d):
         dt=date(y,m,d)
         items = self.index.get_day(dt) + self.heur.get_for_day(dt)
-        # dedup
+        # dedup sencillo
         seen=set(); uniq=[]
         for it in items:
             key=(it["tipo"],it["fondo"],it["detalle"])
@@ -584,14 +577,14 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
     def _insert_date_in_activity(self,y,m,d):
         self.activity_text.insert("insert", f"- {d:02d}/{m:02d}/{y}: "); self.activity_text.see("insert")
 
-    # ---- tabla
+    # ---- Tabla izquierda
     def _load_into_tree(self, df: pd.DataFrame):
         self.tree.delete(*self.tree.get_children())
         for _,row in df.iterrows(): self.tree.insert("", "end", values=[row[c] for c in self.columns])
     def _get_selected_item(self):
         sel=self.tree.selection(); return sel[0] if sel else None
     def _on_select(self,_=None):
-        it=self._get_selected_item();
+        it=self._get_selected_item()
         if not it: return
         vals=self.tree.item(it,"values")
         self.activity_text.delete("1.0","end"); self.activity_text.insert("1.0", vals[1])
@@ -672,10 +665,12 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             idx-=1
         return s
 
-# -------------------- main --------------------
+# ==============================
+# main
+# ==============================
 def main():
     root=tk.Tk()
-    root.title("Editor Calendario FEAGA/FEADER (v0.9)")
+    root.title("Editor Calendario FEAGA/FEADER (v1.0)")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
