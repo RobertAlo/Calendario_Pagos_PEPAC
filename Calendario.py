@@ -1,13 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v2.0.1
-Fix crítico: crear pay_frame ANTES que YearCalendarFrame para evitar AttributeError al disparar on_date_change
-Cambios funcionales (según tu pedido):
-1) Clic en un día: muestra pagos; segundo clic en el mismo día: limpia el panel (toggle).
-2) Botón “Mostrar pagos del mes” arriba a la izquierda (junto a “Pagos de hoy”); lista en el panel inferior.
-3) Eliminada la vista de “Actividad / Ayuda FEAGA / Ayuda FEADER”.
-4) Quitado “Actualizar pagos (web)” de la barra izquierda (se mantiene el de la pestaña Calendario).
-Incluye: pestaña “Índice”, importación PDF/WEB opcional, popups modales propios (topmost y repetibles).
+Calendario FEAGA/FEADER – v2.1.0
+- Elimino el panel izquierdo vacío: los botones “Pagos de hoy” y “Mostrar pagos del mes” van a una barra superior.
+- Calendario y panel de pagos ocupan TODO el ancho (sin huecos).
+- Se mantiene: toggle por día, “Mostrar pagos del mes”, scraping/ingestor opcionales, pestaña Índice, popups modales propios.
 
 Opcionales:
     pip install requests PyPDF2
@@ -466,41 +462,41 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
     def _build_ui(self):
         self.pack(fill="both", expand=True)
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – v2.0.1",
-                  font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
+        # Título
+        ttk.Label(self, text="Calendario FEAGA / FEADER – v2.1.0",
+                  font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,0), anchor="w")
 
-        split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
+        # Barra superior (dos botones) — SIN panel izquierdo
+        topbar = ttk.Frame(self); topbar.pack(fill="x", padx=10, pady=(6,8))
+        ttk.Button(topbar,text="Pagos de hoy",command=self._open_today).pack(side="left")
+        ttk.Button(topbar,text="Mostrar pagos del mes",command=self._show_month_of_selected).pack(side="left", padx=(6,0))
+        ttk.Label(topbar, text="Usa el calendario (clic=toggle) o 'Mostrar pagos del mes'.",
+                  foreground="#555").pack(side="left", padx=12)
 
-        # Izquierda: acciones globales
-        left=ttk.Frame(split); split.add(left, weight=1)
-        toolbar=ttk.Frame(left); toolbar.pack(fill="x", pady=(0,4))
-        # (eliminado) ttk.Button(toolbar,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")
-        ttk.Button(toolbar,text="Pagos de hoy",command=self._open_today).pack(side="left")
-        ttk.Button(toolbar,text="Mostrar pagos del mes",command=self._show_month_of_selected).pack(side="left", padx=(6,0))
-        ttk.Label(left, text="Usa el calendario (clic=toggle) o 'Mostrar pagos del mes'.",
-                  foreground="#555").pack(anchor="w", padx=2)
-
-        # Derecha: pestañas
-        right=ttk.Frame(split); split.add(right, weight=3)
-        self.tabs=ttk.Notebook(right); self.tabs.pack(fill="both", expand=True)
+        # Pestañas
+        self.tabs=ttk.Notebook(self); self.tabs.pack(fill="both", expand=True, padx=10, pady=10)
 
         # --- Calendario
         tab_cal=ttk.Frame(self.tabs); self.tabs.add(tab_cal, text="Calendario")
         v_split=ttk.Panedwindow(tab_cal,orient="vertical"); v_split.pack(fill="both", expand=True)
 
-        # IMPORTANTE: crear pay_frame ANTES del calendario (para que exista si on_date_change se dispara)
-        self.pay_frame=PaymentsInfoFrame(v_split)                          # <-- creado primero
+        # Panel de pagos (ANTES del calendario para evitar callbacks prematuros)
+        self.pay_frame=PaymentsInfoFrame(v_split)
         cal_holder=ttk.Frame(v_split)
         v_split.add(cal_holder,weight=3); v_split.add(self.pay_frame,weight=2)
+        try:
+            v_split.paneconfigure(cal_holder,minsize=140); v_split.paneconfigure(self.pay_frame,minsize=100)
+        except Exception: pass
 
+        # Herramientas del calendario
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(0,4))
-        ttk.Button(tools,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")   # se mantiene aquí
+        ttk.Button(tools,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")
         ttk.Button(tools,text="Importar circulares (PDF)…",command=self._import_pdfs).pack(side="left",padx=(6,0))
         ttk.Button(tools,text="Guardar índice…",command=self._save_index).pack(side="right")
         ttk.Button(tools,text="Cargar índice…",command=self._load_index).pack(side="right",padx=(6,0))
         ttk.Button(tools,text="Vaciar pagos (mantener heurística)",command=self._reset_index_only).pack(side="right",padx=(6,0))
 
-        # Calendario (después de pay_frame)
+        # Calendario
         self.yearcal=YearCalendarFrame(
             cal_holder, year=date.today().year,
             on_date_change=self._on_calendar_change,
@@ -511,10 +507,6 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             )
         )
         self.yearcal.pack(fill="both", expand=True)
-
-        try:
-            v_split.paneconfigure(cal_holder,minsize=140); v_split.paneconfigure(self.pay_frame,minsize=100)
-        except Exception: pass
 
         # --- Índice
         tab_idx=ttk.Frame(self.tabs); self.tabs.add(tab_idx,text="Índice")
@@ -674,7 +666,6 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
     # ---- Integración calendario / toggle día
     def _on_calendar_change(self,y,m,d):
         dt = date(y,m,d)
-        # Salvaguarda: si por algún motivo aún no existiera pay_frame, salimos silenciosos
         if not hasattr(self, "pay_frame"): return
         self._show_day(dt, allow_popup=True)
 
@@ -723,7 +714,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v2.0.1")
+    root.title("Calendario FEAGA/FEADER – v2.1.0")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
