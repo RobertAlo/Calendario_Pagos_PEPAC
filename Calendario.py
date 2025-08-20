@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Editor Calendario FEAGA/FEADER (v1.2.7)
-Cambios clave v1.2.7:
-- FIX crítico: el calendario disparaba on_date_change durante su __init__ antes de existir self.pay_frame.
-  -> Reordenado _build_ui: ahora se crea self.pay_frame ANTES de instanciar YearCalendarFrame.
-- Se mantienen v1.2.6: índice SOLO datos reales; botón siempre evalúa/avisa; captura excepciones con traceback.
+Editor Calendario FEAGA/FEADER (v1.2.8)
+Cambios clave v1.2.8:
+- Wrappers _mb_info/_mb_error que fuerzan los messagebox en primer plano (topmost) con parent correcto.
+- Botón "Mostrar pagos (día seleccionado)" siempre ejecuta, actualiza estado y muestra aviso cuando procede.
+- Se mantiene el FIX de v1.2.7 (creación de pay_frame antes que el calendario) y el índice solo para datos "reales".
 Requisitos base:
     pip install pandas xlsxwriter
 Opcionales:
@@ -385,6 +385,43 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self._remember_and_show(date.today())
         self._update_today_banner()
 
+    # -------- Messagebox wrappers (siempre en primer plano) --------
+    def _mb_info(self, title, message):
+        parent = self.winfo_toplevel()
+        try:
+            parent.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            parent.bell()
+        except Exception:
+            pass
+        try:
+            messagebox.showinfo(title, message, parent=parent)
+        finally:
+            try:
+                parent.attributes("-topmost", False)
+            except Exception:
+                pass
+
+    def _mb_error(self, title, message):
+        parent = self.winfo_toplevel()
+        try:
+            parent.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            parent.bell()
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(title, message, parent=parent)
+        finally:
+            try:
+                parent.attributes("-topmost", False)
+            except Exception:
+                pass
+
     # ---- Datos tabla
     def _build_dataset(self):
         data = {
@@ -433,7 +470,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tk.Button(self.alert_bar, text="X", command=lambda:self.alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
         self.alert_bar.pack_forget()
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.7)",
+        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.8)",
                   font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
 
         split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
@@ -485,15 +522,12 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tab_cal=ttk.Frame(self.tabs); self.tabs.add(tab_cal,text="Calendario")
         v_split=ttk.Panedwindow(tab_cal,orient="vertical"); v_split.pack(fill="both", expand=True)
 
-        # IMPORTANT: crear pay_frame ANTES del calendario (evita AttributeError durante el __init__ del calendario)
+        # pay_frame ANTES del calendario
         self.pay_frame=PaymentsInfoFrame(v_split)
         cal_holder=ttk.Frame(v_split)
-
-        # Añadir al paned en orden visual (calendario arriba, pagos abajo)
         v_split.add(cal_holder,weight=3)
         v_split.add(self.pay_frame,weight=2)
 
-        # Ahora sí, ya existe pay_frame: el callback puede ejecutarse sin errores
         self.yearcal=YearCalendarFrame(
             cal_holder, year=date.today().year,
             on_date_change=self._on_calendar_change,
@@ -558,11 +592,11 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 if not sc.available(): raise RuntimeError("Falta 'requests'.")
                 sc.fetch_into_index(self.index, year_hint=date.today().year)
                 self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(),
-                                      messagebox.showinfo("Listo","Pagos actualizados desde FEGA (web).")))
+                                      self._mb_info("Listo","Pagos actualizados desde FEGA (web).")))
             except Exception as ex:
-                self.after(0, lambda: messagebox.showerror("Error", f"No se pudo completar el scraping web:\n{ex}"))
+                self.after(0, lambda: self._mb_error("Error", f"No se pudo completar el scraping web:\n{ex}"))
         threading.Thread(target=run, daemon=True).start()
-        messagebox.showinfo("Actualizando","Buscando ventanas en notas FEGA…")
+        self._mb_info("Actualizando","Buscando ventanas en notas FEGA…")
 
     def _import_pdfs(self):
         folder=filedialog.askdirectory(title="Selecciona la carpeta con las circulares FEGA (PDF)")
@@ -573,16 +607,16 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 if not ing.available(): raise RuntimeError("Falta 'PyPDF2'.")
                 ing.ingest_folder(Path(folder), self.index, default_year=date.today().year)
                 self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(),
-                                      messagebox.showinfo("Listo",f"Se importaron PDFs de {folder}")))
+                                      self._mb_info("Listo",f"Se importaron PDFs de {folder}")))
             except Exception as ex:
-                self.after(0, lambda: messagebox.showerror("Error", f"No se pudieron importar los PDFs:\n{ex}"))
+                self.after(0, lambda: self._mb_error("Error", f"No se pudieron importar los PDFs:\n{ex}"))
         threading.Thread(target=run, daemon=True).start()
-        messagebox.showinfo("Importando","Leyendo circulares PDF…")
+        self._mb_info("Importando","Leyendo circulares PDF…")
 
     def _reset_index_only(self):
         self.index.clear()
         self.yearcal.refresh(); self._update_today_banner()
-        messagebox.showinfo("Pagos","Índice vaciado. Se mantiene la heurística (no persistente).")
+        self._mb_info("Pagos","Índice vaciado. Se mantiene la heurística (no persistente).")
 
     # ---- Integración calendario -> mini-frame
     def _on_calendar_change(self,y,m,d):
@@ -603,7 +637,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             self.yearcal.ensure_selection_in_current_year()
             dt = self.yearcal.get_selected_date() or self.current_selected_date
             if not dt:
-                messagebox.showinfo("Calendario","Selecciona primero un día del calendario.")
+                self._mb_info("Calendario","Selecciona primero un día del calendario.")
                 self.status_lbl.config(text="Sin selección")
                 return
 
@@ -612,14 +646,14 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             only_none = (not real) and len(heur)==1 and heur[0]["tipo"]=="Sin pagos FEAGA generales"
 
             if only_none:
-                messagebox.showinfo("Pagos", f"No hay pagos para la fecha seleccionada ({dt.strftime('%d/%m/%Y')}).")
+                self._mb_info("Pagos", f"No hay pagos para la fecha seleccionada ({dt.strftime('%d/%m/%Y')}).")
             elif not real:
-                messagebox.showinfo("Pagos", f"No hay pagos concretos indexados para {dt.strftime('%d/%m/%Y')}.\nSe muestran referencias heurísticas generales.")
+                self._mb_info("Pagos", f"No hay pagos concretos indexados para {dt.strftime('%d/%m/%Y')}.\nSe muestran referencias heurísticas generales.")
 
             self._remember_and_show(dt)
             self.status_lbl.config(text=f"Mostrado {dt.strftime('%d/%m/%Y')} (reales={len(real)})")
         except Exception:
-            messagebox.showerror("Error en botón", traceback.format_exc())
+            self._mb_error("Error en botón", traceback.format_exc())
             self.status_lbl.config(text="Error al mostrar")
 
     def _insert_date_in_activity(self,y,m,d):
@@ -638,7 +672,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self.activity_text.delete("1.0","end"); self.activity_text.insert("1.0", vals[1])
     def edit_selected_modal(self):
         it=self._get_selected_item()
-        if not it: messagebox.showinfo("Editar fila","Selecciona primero una fila."); return
+        if not it: self._mb_info("Editar fila","Selecciona primero una fila."); return
         vals=list(self.tree.item(it,"values"))
         win=tk.Toplevel(self); win.title("Editar fila"); win.transient(self.winfo_toplevel()); win.grab_set()
         ttk.Label(win,text="Mes:").grid(row=0,column=0,sticky="w",padx=6,pady=(8,2))
@@ -671,16 +705,16 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         e.bind("<Return>",save); e.bind("<Escape>",lambda _ :top.destroy()); e.bind("<FocusOut>",save)
     def apply_activity_to_selected(self):
         it=self._get_selected_item()
-        if not it: messagebox.showinfo("Aplicar","Selecciona primero una fila."); return
+        if not it: self._mb_info("Aplicar","Selecciona primero una fila."); return
         vals=list(self.tree.item(it,"values")); vals[1]=self.activity_text.get("1.0","end").rstrip("\n")
-        self.tree.item(it,values=vals); messagebox.showinfo("Aplicar","Actividad actualizada.")
+        self.tree.item(it,values=vals); self._mb_info("Aplicar","Actividad actualizada.")
     def add_row(self):
         self.tree.insert("", "end", values=["","","",""])
         children=self.tree.get_children()
         if children: self.tree.selection_set(children[-1]); self.tree.see(children[-1])
     def delete_selected(self):
         it=self._get_selected_item()
-        if not it: messagebox.showinfo("Eliminar fila","Selecciona primero una fila."); return
+        if not it: self._mb_info("Eliminar fila","Selecciona primero una fila."); return
         self.tree.delete(it); self.activity_text.delete("1.0","end")
     def export_to_excel(self):
         df=self._df_from_tree()
@@ -696,11 +730,11 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
                 ws.set_column(f'{col}:{col}',50,fmt)
                 for i,row in df.iterrows():
                     ws.set_row(i+1, 15*(str(row['Actividad']).count('\n')+1))
-            messagebox.showinfo("Exportación completada", f"Archivo guardado en:\n{path}")
+            self._mb_info("Exportación completada", f"Archivo guardado en:\n{path}")
         except Exception as ex:
-            messagebox.showerror("Error al exportar", f"No se pudo exportar el Excel.\n\nDetalle: {ex}")
+            self._mb_error("Error al exportar", f"No se pudo exportar el Excel.\n\nDetalle: {ex}")
     def reset_data(self):
-        if messagebox.askyesno("Restablecer","¿Restablecer los datos originales?"):
+        if messagebox.askyesno("Restablecer","¿Restablecer los datos originales?", parent=self.winfo_toplevel()):
             self._build_dataset(); self._load_into_tree(self.df); self.activity_text.delete("1.0","end")
     def _df_from_tree(self)->pd.DataFrame:
         return pd.DataFrame([self.tree.item(i,"values") for i in self.tree.get_children()], columns=self.columns)
@@ -716,7 +750,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Editor Calendario FEAGA/FEADER (v1.2.7)")
+    root.title("Editor Calendario FEAGA/FEADER (v1.2.8)")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
