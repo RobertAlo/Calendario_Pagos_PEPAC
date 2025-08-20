@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Editor Calendario FEAGA/FEADER (v1.2.4)
-- FIX Windows: usar tk.Radiobutton (indicatoron=0) en vez de ttk.Radiobutton para los días.
-- Mantengo trace_add('write') en la StringVar + botón "Mostrar pagos (día seleccionado)".
-- Selección global robusta entre meses/años, aviso de pagos de hoy, scraping/ingestor opcionales.
-- NUEVO: Avisa con messagebox si el día seleccionado no tiene pagos concretos indexados.
-- NUEVO: Asegura que la selección pertenece al año visible (ajuste automático).
+Editor Calendario FEAGA/FEADER (v1.2.5)
+- Botón "Mostrar pagos (día seleccionado)" ahora:
+  * Fuerza una selección válida en el año visible.
+  * Avisa con messagebox si no hay datos reales para ese día.
+  * Diferencia entre "sin nada" y "solo heurística".
+- La heurística NO se guarda en el índice; solo datos reales (web/PDF).
+- Selección robusta entre años (ajuste automático) para evitar "no hace nada".
 Requisitos base:
     pip install pandas xlsxwriter
 Opcionales:
@@ -48,7 +49,7 @@ def daterange(d1: date, d2: date):
         yield cur
         cur += timedelta(days=1)
 
-# -------------------- Índice de pagos --------------------
+# -------------------- Índice de pagos (solo datos reales) --------------------
 class PaymentsIndex:
     def __init__(self): self._by_date = {}
     def clear(self): self._by_date.clear()
@@ -70,22 +71,22 @@ class HeuristicPaymentsProvider:
         if start_ant <= dt <= end_ant:
             out.append({"tipo":"Anticipo ayudas directas","fondo":"FEAGA",
                         "detalle":f"Hasta el 70% campaña {campaign_year}. Ventana 16/10–30/11.",
-                        "fuente":"Heurística FEGA"})
+                        "fuente":"Heurística FEGA","heuristica":True})
         if (start_sal <= dt <= date(campaign_year,12,31)) or (date(campaign_year+1,1,1) <= dt <= end_sal):
             out.append({"tipo":"Saldo ayudas directas","fondo":"FEAGA",
                         "detalle":f"Hasta el 30% restante campaña {campaign_year}. Ventana 01/12–30/06 (año+1).",
-                        "fuente":"Heurística FEGA"})
+                        "fuente":"Heurística FEGA","heuristica":True})
         if not out:
             out.append({"tipo":"Sin pagos FEAGA generales","fondo":"—",
                         "detalle":"Fuera de ventanas de anticipo/saldo. Revise resoluciones específicas.",
-                        "fuente":"Heurística FEGA"})
+                        "fuente":"Heurística FEGA","heuristica":True})
         return out
 
     def get_ranges_for_campaign(self, campaign_year:int):
         return (date(campaign_year,10,16), date(campaign_year,11,30),
                 date(campaign_year,12,1), date(campaign_year+1,6,30))
 
-# -------------------- Scraper / Ingestor (opcionales) --------------------
+# -------------------- Scraper / Ingestor (opcionales, SOLO rellenan índice) --------------------
 class FegaWebScraper:
     NOTE_URLS = [
         "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf",
@@ -267,7 +268,6 @@ class YearCalendarFrame(ttk.Frame):
             ttk.Label(f,text=d,style=("CalHeadWE.TLabel" if i in (5,6) else "CalHead.TLabel")).grid(row=1,column=i,padx=1,sticky="nsew")
 
         weeks=calendar.monthcalendar(year,month)
-        # Fuentes y colores para tk.Radiobutton
         font_norm=("Segoe UI",9)
         font_bold=("Segoe UI",9,"bold")
         color_weekend="#b00000"
@@ -281,7 +281,6 @@ class YearCalendarFrame(ttk.Frame):
 
                 has=self.has_events_predicate(year,month,day)
                 is_weekend = (c in (5,6))
-                # Estética
                 cfg = {
                     "font": (font_bold if has else font_norm),
                     "bd": 1,
@@ -300,9 +299,7 @@ class YearCalendarFrame(ttk.Frame):
                     f, text=str(day), value=val, variable=self.sel_var, **cfg
                 )
                 rb.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
-                # Red de seguridad: al soltar el click, nos aseguramos de que la selección está puesta
                 rb.bind("<ButtonRelease-1>", lambda e, v=val: self.sel_var.set(v))
-                # Doble clic: insertar fecha en el texto
                 rb.bind("<Double-Button-1>", lambda e,y=year,m=month,d=day:self._dbl(y,m,d))
 
         for c in range(7): f.columnconfigure(c,weight=1,uniform="d")
@@ -314,7 +311,6 @@ class YearCalendarFrame(ttk.Frame):
     def go_to_date(self, dt: date):
         self._set(dt.year)
         self.sel_var.set(f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}")
-        # _notify_change salta por trace_add
 
     def get_selected_date(self):
         val=self.sel_var.get()
@@ -335,7 +331,6 @@ class YearCalendarFrame(ttk.Frame):
         try:
             y, m, d = map(int, val.split("-"))
         except Exception:
-            # No había selección: elige una razonable
             if self.current_year == date.today().year:
                 y, m, d = self.current_year, date.today().month, date.today().day
             else:
@@ -344,7 +339,6 @@ class YearCalendarFrame(ttk.Frame):
             return
 
         if y != self.current_year:
-            # Mantén mes/día, pero cambia el año y ajusta día si no existe
             last_day = calendar.monthrange(self.current_year, m)[1]
             d = min(d, last_day)
             self.sel_var.set(f"{self.current_year:04d}-{m:02d}-{d:02d}")
@@ -362,7 +356,6 @@ class YearCalendarFrame(ttk.Frame):
 
     def _dbl(self,y,m,d):
         self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
-        # trace_add disparará _notify_change
         if callable(self.on_date_double_click): self.on_date_double_click(y,m,d)
 
     # --- Navegación año
@@ -371,7 +364,6 @@ class YearCalendarFrame(ttk.Frame):
         except: year=self.current_year
         year=max(1900,min(2100,year))
         self.current_year=year; self.year_var.set(year); self._grid_year()
-        # Ajusta selección al año visible tras reconstruir el grid
         self.ensure_selection_in_current_year()
     def _prev(self): self._set(self.current_year-1)
     def _next(self): self._set(self.current_year+1)
@@ -412,7 +404,9 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self.current_selected_date: date | None = None  # respaldo a nivel app
 
         self._build_dataset(); self._build_ui(); self._load_into_tree(self.df)
-        self._populate_index_from_heuristics_for_year(date.today().year)
+
+        # OJO: ya no metemos la heurística en el índice. El índice es solo "datos reales".
+        # La heurística se aplica al vuelo en la vista.
 
         # Selección y pintado inicial: HOY
         self.yearcal.go_to_date(date.today())
@@ -468,7 +462,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tk.Button(self.alert_bar, text="X", command=lambda:self.alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
         self.alert_bar.pack_forget()
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.4)",
+        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.5)",
                   font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
 
         split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
@@ -517,13 +511,16 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tab_cal=ttk.Frame(self.tabs); self.tabs.add(tab_cal,text="Calendario")
         v_split=ttk.Panedwindow(tab_cal,orient="vertical"); v_split.pack(fill="both", expand=True)
         cal_holder=ttk.Frame(v_split); v_split.add(cal_holder,weight=3)
+
         self.yearcal=YearCalendarFrame(
             cal_holder, year=date.today().year,
-            on_date_change=self._on_calendar_change,              # automático via trace
+            on_date_change=self._on_calendar_change,
             on_date_double_click=self._insert_date_in_activity,
-            has_events_predicate=lambda y,m,d: self.index.has_day(date(y,m,d))
+            # Resalta si hay datos reales o, al menos, ventana heurística (no "Sin pagos")
+            has_events_predicate=self._has_event_or_heuristic
         )
         self.yearcal.pack(fill="both", expand=True)
+
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(4,0))
         ttk.Button(tools,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")
         ttk.Button(tools,text="Importar circulares (PDF)…",command=self._import_pdfs).pack(side="left",padx=(6,0))
@@ -538,17 +535,19 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", self._on_double_click_cell)
 
-    # ---- índice + avisos
-    def _populate_index_from_heuristics_for_year(self, year:int):
-        start_ant,end_ant,start_sal,end_sal = self.heur.get_ranges_for_campaign(year if date.today().month>=10 else year-1)
-        self.index.add_range(start_ant,end_ant,tipo="Anticipo ayudas directas",fondo="FEAGA",
-                             detalle="Ventana general de anticipos (heurística).",fuente="Heurística FEGA")
-        self.index.add_range(start_sal,end_sal,tipo="Saldo ayudas directas",fondo="FEAGA",
-                             detalle="Ventana general de saldos (heurística).",fuente="Heurística FEGA")
+    # ---- ayudas para resaltado/calendario
+    def _has_event_or_heuristic(self, y, m, d):
+        dt = date(y,m,d)
+        if self.index.has_day(dt):  # datos reales
+            return True
+        # si hay ventana heurística (no el mensaje "Sin pagos ..."), también marcamos
+        heur = self.heur.get_for_day(dt)
+        return any(i["tipo"] != "Sin pagos FEAGA generales" for i in heur)
 
+    # ---- avisos "hoy"
     def _effective_today_items(self):
         today=date.today()
-        items=self.index.get_day(today)+[i for i in self.heur.get_for_day(today) if i["fondo"]=="FEAGA"]
+        items=self.index.get_day(today)+[i for i in self.heur.get_for_day(today) if i["tipo"]!="Sin pagos FEAGA generales"]
         seen=set(); out=[]
         for it in items:
             key=(it["tipo"],it["fondo"],it["detalle"])
@@ -608,17 +607,17 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         messagebox.showinfo("Importando","Leyendo circulares PDF…")
 
     def _reset_to_heuristics(self):
-        self.index.clear(); self._populate_index_from_heuristics_for_year(self.yearcal.current_year)
+        self.index.clear()
         self.yearcal.refresh(); self._update_today_banner()
-        messagebox.showinfo("Pagos","Índice reiniciado (sólo heurística).")
+        messagebox.showinfo("Pagos","Índice reiniciado (sólo heurística en vista).")
 
     # ---- Integración calendario -> mini-frame
     def _on_calendar_change(self,y,m,d):
         self._remember_and_show(date(y,m,d))
 
     def _remember_and_show(self, dt: date):
-        self.current_selected_date = dt  # respaldo
-        # Combina concretos + heurística, deduplicando
+        self.current_selected_date = dt
+        # Combina datos reales + heurística, deduplicando
         items = self.index.get_day(dt) + self.heur.get_for_day(dt)
         seen=set(); uniq=[]
         for it in items:
@@ -636,14 +635,16 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
             messagebox.showinfo("Calendario","Selecciona primero un día del calendario.")
             return
 
-        # Si no hay pagos concretos indexados en esa fecha, avisamos (aunque se muestre la heurística)
-        concrete = self.index.get_day(dt)
-        if not concrete:
-            messagebox.showinfo(
-                "Pagos",
-                "No hay pagos concretos indexados para la fecha seleccionada.\n"
-                "Se muestran, si proceden, referencias heurísticas generales."
-            )
+        real = self.index.get_day(dt)
+        heur = self.heur.get_for_day(dt)
+
+        # Casuística de avisos
+        only_sin = (not real) and len(heur)==1 and heur[0]["tipo"]=="Sin pagos FEAGA generales"
+        if only_sin:
+            messagebox.showinfo("Pagos","No hay pagos para la fecha seleccionada.")
+        elif not real:
+            messagebox.showinfo("Pagos","No hay pagos concretos indexados para la fecha seleccionada.\nSe muestran referencias heurísticas generales.")
+
         self._remember_and_show(dt)
 
     def _insert_date_in_activity(self,y,m,d):
@@ -740,7 +741,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Editor Calendario FEAGA/FEADER (v1.2.4)")
+    root.title("Editor Calendario FEAGA/FEADER (v1.2.5)")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
