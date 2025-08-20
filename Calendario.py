@@ -373,52 +373,65 @@ class YearCalendarFrame(ttk.Frame):
     def _go_today(self): self.go_to_date(date.today())
 
 # -------------------- Mini-frame de pagos --------------------
+# -------------------- Mini-frame de pagos (sin selección) --------------------
 class PaymentsInfoFrame(ttk.Frame):
     def __init__(self, master):
-        super().__init__(master,padding=(6,4,6,4))
-        top=ttk.Frame(self); top.grid(row=0,column=0,sticky="ew")
-        ttk.Label(top,text="Pagos en la fecha seleccionada",font=("Segoe UI",10,"bold")).pack(side="left")
-        self.date_lbl=ttk.Label(top,text="—"); self.date_lbl.pack(side="right")
+        super().__init__(master, padding=(6,4,6,4))
+        top = ttk.Frame(self); top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, text="Pagos en la fecha seleccionada", font=("Segoe UI", 10, "bold")).pack(side="left")
+        # título dinámico derecha (fecha/mes + conteo)
+        self.date_lbl = ttk.Label(top, text="—")
+        self.date_lbl.pack(side="right")
 
-        cols=("fecha","tipo","fondo","detalle","fuente")
-        self.tree=ttk.Treeview(self,columns=cols,show="headings")
-        headers={"fecha":(92,"w"),"tipo":(180,"w"),"fondo":(80,"w"),"detalle":(640,"w"),"fuente":(240,"w")}
-        for c,(w,anc) in headers.items():
-            self.tree.heading(c,text=c.capitalize()); self.tree.column(c,width=w,anchor=anc,stretch=True)
-        self.tree.grid(row=1,column=0,sticky="nsew",pady=(6,0))
-        ysb=ttk.Scrollbar(self,orient="vertical",command=self.tree.yview)
-        xsb=ttk.Scrollbar(self,orient="horizontal",command=self.tree.xview)
-        self.tree.configure(yscrollcommand=ysb.set,xscrollcommand=xsb.set)
-        ysb.grid(row=1,column=1,sticky="ns"); xsb.grid(row=2,column=0,sticky="ew")
-        self.grid_rowconfigure(1,weight=1); self.grid_columnconfigure(0,weight=1)
+        cols = ("fecha", "tipo", "fondo", "detalle", "fuente")
+        # 👉 clave: desactivar selección visual
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="none")
+        headers = {"fecha": (92, "w"), "tipo": (180, "w"), "fondo": (80, "w"), "detalle": (640, "w"), "fuente": (240, "w")}
+        for c, (w, anc) in headers.items():
+            self.tree.heading(c, text=c.capitalize()); self.tree.column(c, width=w, anchor=anc, stretch=True)
 
-        ttk.Label(self,text="Nota: FEAGA 16/10–30/11 (anticipos), 01/12–30/06 (saldos). FEADER según resoluciones.",
-                  foreground="#444").grid(row=3,column=0,columnspan=2,sticky="w",pady=(6,0))
+        self.tree.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        ysb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        xsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        ysb.grid(row=1, column=1, sticky="ns"); xsb.grid(row=2, column=0, sticky="ew")
+        self.grid_rowconfigure(1, weight=1); self.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(
+            self,
+            text="Nota: FEAGA 16/10–30/11 (anticipos), 01/12–30/06 (saldos). FEADER según resoluciones.",
+            foreground="#444"
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _set_title(self, base: str, n: int | None = None):
+        # Muestra “Día 17/05/2025 · 2 pagos” o “Mes 05/2025 · 0 pagos”
+        suffix = (f" · {n} pago{'s' if (n or 0) != 1 else ''}" if n is not None else "")
+        self.date_lbl.config(text=f"{base}{suffix}")
 
     def clear(self, title="—"):
-        self.date_lbl.config(text=title)
+        self._set_title(title, 0)
         self.tree.delete(*self.tree.get_children())
         self.update_idletasks()
 
-    def show_list(self, title, rows):
-        self.date_lbl.config(text=title)
+    def show_list(self, title: str, rows: list[dict]):
+        self._set_title(title, len(rows))
         self.tree.delete(*self.tree.get_children())
         for it in rows:
-            self.tree.insert("", "end", values=(it.get("fecha",""), it["tipo"], it["fondo"], it["detalle"], it.get("fuente","")))
+            self.tree.insert("", "end", values=(it.get("fecha", ""), it["tipo"], it["fondo"], it["detalle"], it.get("fuente", "")))
         self.update_idletasks()
 
-    def show_day(self, dt: date, items):
-        rows=[]
+    def show_day(self, dt: date, items: list[dict]):
+        rows = []
         for it in items:
-            row=dict(it); row["fecha"]=dt.strftime("%d/%m/%Y"); rows.append(row)
+            row = dict(it); row["fecha"] = dt.strftime("%d/%m/%Y"); rows.append(row)
         self.show_list(dt.strftime("Día %d/%m/%Y"), rows)
 
-    def show_month(self, y:int, m:int, dated_items):
-        rows=[]
-        for d,it in dated_items:
-            row=dict(it); row["fecha"]=d.strftime("%d/%m/%Y"); rows.append(row)
-        title=f"Mes {m:02d}/{y}"
-        self.show_list(title, rows)
+    def show_month(self, y: int, m: int, dated_items: list[tuple[date, dict]]):
+        rows = []
+        for d, it in dated_items:
+            row = dict(it); row["fecha"] = d.strftime("%d/%m/%Y"); rows.append(row)
+        self.show_list(f"Mes {m:02d}/{y}", rows)
+
 
 # -------------------- App principal --------------------
 class CalendarioFEAGA_FEADERFrame(tk.Frame):
