@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Editor Calendario FEAGA/FEADER (v1.0)
-- FIX definitivo: selección robusta entre meses/años usando ttk.Radiobutton (indicator=0)
-  con una única StringVar. Cada cambio actualiza SIEMPRE el mini-frame de pagos.
-- Aviso de pagos de hoy, scraping opcional, importación de PDFs, exportación a Excel,
-  edición de la tabla de actividades.
+Editor Calendario FEAGA/FEADER (v1.1)
+- Botón añadido: "Mostrar pagos (día seleccionado)" para forzar el pintado del mini-frame
+  incluso si el cambio del radiobutton no disparase el evento automático.
+- "Pagos de hoy" ahora también invoca el mismo método de pintado directo.
+- Selección robusta con ttk.Radiobutton + StringVar (indicator=0).
+- Scraping/ingestor opcionales, heurística FEAGA, exportación a Excel, edición de tabla.
 
 Requisitos base:
     pip install pandas xlsxwriter
-Opcionales para enriquecer:
+Opcionales:
     pip install requests PyPDF2
 """
 
@@ -23,7 +24,7 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 
 # ==============================
-# Utilidades de fechas/texto
+# Utilidades
 # ==============================
 SPANISH_MONTHS = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
@@ -80,7 +81,7 @@ class HeuristicPaymentsProvider:
                         "fuente":"Heurística FEGA"})
         if (start_sal <= dt <= date(campaign_year,12,31)) or (date(campaign_year+1,1,1) <= dt <= end_sal):
             out.append({"tipo":"Saldo ayudas directas","fondo":"FEAGA",
-                        "detalle":f"Hasta el 30% restante campaña {campaign_year}. Ventana 01/12–30/06(año+1).",
+                        "detalle":f"Hasta el 30% restante campaña {campaign_year}. Ventana 01/12–30/06 (año+1).",
                         "fuente":"Heurística FEGA"})
         if not out:
             out.append({"tipo":"Sin pagos FEAGA generales","fondo":"—",
@@ -222,7 +223,7 @@ class YearCalendarFrame(ttk.Frame):
         self.on_date_double_click = on_date_double_click
         self.has_events_predicate = has_events_predicate or (lambda y,m,d: False)
 
-        # Variable de selección única en todo el calendario
+        # Selección única en todo el calendario
         self.sel_var = tk.StringVar(value="")
 
         self._styles(); self._controls()
@@ -269,8 +270,8 @@ class YearCalendarFrame(ttk.Frame):
 
         self.scroll.inner.rowconfigure(0,weight=1); self.scroll.inner.columnconfigure(0,weight=1)
 
-        # Si ya había una fecha seleccionada (mismo año), el radiobutton correcto quedará marcado
-        self._notify_change()  # asegura que el panel de pagos está alineado con la selección actual
+        # Alinear el mini-frame con la selección actual si la hay
+        self._notify_change()
 
     def _month(self,parent,year,month):
         f=ttk.Frame(parent,borderwidth=1,relief="solid",padding=(4,3,4,4))
@@ -295,7 +296,6 @@ class YearCalendarFrame(ttk.Frame):
                     f, text=str(day), value=val, variable=self.sel_var,
                     command=self._notify_change, style=style
                 )
-                # aspecto botón
                 rb.configure(takefocus=False)
                 rb.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
                 rb.bind("<Double-Button-1>", lambda e,y=year,m=month,d=day:self._dbl(y,m,d))
@@ -311,6 +311,12 @@ class YearCalendarFrame(ttk.Frame):
         self.sel_var.set(f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}")
         self._notify_change()
 
+    def get_selected_date(self):
+        val=self.sel_var.get()
+        if not val: return None
+        y,m,d = map(int, val.split("-"))
+        return date(y,m,d)
+
     # --- Eventos
     def _notify_change(self):
         val=self.sel_var.get()
@@ -320,7 +326,6 @@ class YearCalendarFrame(ttk.Frame):
         if callable(self.on_date_change): self.on_date_change(y,m,d)
 
     def _dbl(self,y,m,d):
-        # asegura que hay selección
         self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
         self._notify_change()
         if callable(self.on_date_double_click): self.on_date_double_click(y,m,d)
@@ -423,7 +428,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tk.Button(self.alert_bar, text="X", command=lambda:self.alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
         self.alert_bar.pack_forget()
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.0)",
+        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.1)",
                   font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
 
         split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
@@ -474,7 +479,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         cal_holder=ttk.Frame(v_split); v_split.add(cal_holder,weight=3)
         self.yearcal=YearCalendarFrame(
             cal_holder, year=date.today().year,
-            on_date_change=self._on_calendar_change,
+            on_date_change=self._on_calendar_change,              # automático
             on_date_double_click=self._insert_date_in_activity,
             has_events_predicate=lambda y,m,d: self.index.has_day(date(y,m,d))
         )
@@ -482,6 +487,8 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(4,0))
         ttk.Button(tools,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")
         ttk.Button(tools,text="Importar circulares (PDF)…",command=self._import_pdfs).pack(side="left",padx=(6,0))
+        # === NUEVO: botón manual para forzar el pintado ===
+        ttk.Button(tools,text="Mostrar pagos (día seleccionado)",command=self._show_selected_date_payments).pack(side="left",padx=(6,0))
         ttk.Button(tools,text="Vaciar pagos (mantener heurística)",command=self._reset_to_heuristics).pack(side="right")
 
         self.pay_frame=PaymentsInfoFrame(v_split); v_split.add(self.pay_frame,weight=2)
@@ -527,6 +534,8 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
     def _open_today(self):
         self._select_calendar_tab()
         self.yearcal.go_to_date(date.today())
+        # Fuerza pintado, incluso si el evento del radiobutton no llegara
+        self._show_payments_for(date.today())
 
     # ---- Carga desde FEGA (web/PDF)
     def _update_from_web(self):
@@ -564,9 +573,20 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 
     # ---- Integración calendario -> mini-frame
     def _on_calendar_change(self,y,m,d):
-        dt=date(y,m,d)
+        # Automático (cuando el radiobutton dispare el command)
+        self._show_payments_for(date(y,m,d))
+
+    def _show_selected_date_payments(self):
+        # Manual (botón solicitado)
+        dt=self.yearcal.get_selected_date()
+        if not dt:
+            messagebox.showinfo("Calendario","Selecciona primero un día del calendario.")
+            return
+        self._show_payments_for(dt)
+
+    def _show_payments_for(self, dt: date):
         items = self.index.get_day(dt) + self.heur.get_for_day(dt)
-        # dedup sencillo
+        # dedup
         seen=set(); uniq=[]
         for it in items:
             key=(it["tipo"],it["fondo"],it["detalle"])
@@ -670,7 +690,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 # ==============================
 def main():
     root=tk.Tk()
-    root.title("Editor Calendario FEAGA/FEADER (v1.0)")
+    root.title("Editor Calendario FEAGA/FEADER (v1.1)")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
