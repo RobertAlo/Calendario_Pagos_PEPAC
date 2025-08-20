@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Editor Calendario FEAGA/FEADER (v1.2.3)
+Editor Calendario FEAGA/FEADER (v1.2.4)
 - FIX Windows: usar tk.Radiobutton (indicatoron=0) en vez de ttk.Radiobutton para los días.
 - Mantengo trace_add('write') en la StringVar + botón "Mostrar pagos (día seleccionado)".
 - Selección global robusta entre meses/años, aviso de pagos de hoy, scraping/ingestor opcionales.
+- NUEVO: Avisa con messagebox si el día seleccionado no tiene pagos concretos indexados.
+- NUEVO: Asegura que la selección pertenece al año visible (ajuste automático).
 Requisitos base:
     pip install pandas xlsxwriter
 Opcionales:
@@ -237,7 +239,10 @@ class YearCalendarFrame(ttk.Frame):
         ttk.Button(top,text="Hoy",command=self._go_today).grid(row=0,column=3)
         self.info=ttk.Label(top,text="(clic=pagos · doble clic=insertar)"); self.info.grid(row=0,column=5,sticky="e")
 
-    def refresh(self): self._grid_year()
+    def refresh(self):
+        self._grid_year()
+        # Ajusta selección al año visible para evitar "fechas fantasma"
+        self.ensure_selection_in_current_year()
 
     def _grid_year(self):
         for ch in self.scroll.inner.winfo_children(): ch.destroy()
@@ -320,6 +325,30 @@ class YearCalendarFrame(ttk.Frame):
         except Exception:
             return None
 
+    def ensure_selection_in_current_year(self):
+        """
+        Garantiza que la fecha seleccionada pertenezca al año visible.
+        Si no hay selección, usa hoy si coincide el año; en otro caso 01/01 del año visible.
+        Si el día no existe (p.ej. 29/02), ajusta al último día del mes.
+        """
+        val = self.sel_var.get()
+        try:
+            y, m, d = map(int, val.split("-"))
+        except Exception:
+            # No había selección: elige una razonable
+            if self.current_year == date.today().year:
+                y, m, d = self.current_year, date.today().month, date.today().day
+            else:
+                y, m, d = self.current_year, 1, 1
+            self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
+            return
+
+        if y != self.current_year:
+            # Mantén mes/día, pero cambia el año y ajusta día si no existe
+            last_day = calendar.monthrange(self.current_year, m)[1]
+            d = min(d, last_day)
+            self.sel_var.set(f"{self.current_year:04d}-{m:02d}-{d:02d}")
+
     # --- Eventos
     def _notify_change(self):
         val=self.sel_var.get()
@@ -342,6 +371,8 @@ class YearCalendarFrame(ttk.Frame):
         except: year=self.current_year
         year=max(1900,min(2100,year))
         self.current_year=year; self.year_var.set(year); self._grid_year()
+        # Ajusta selección al año visible tras reconstruir el grid
+        self.ensure_selection_in_current_year()
     def _prev(self): self._set(self.current_year-1)
     def _next(self): self._set(self.current_year+1)
     def _go_today(self): self.go_to_date(date.today())
@@ -437,7 +468,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         tk.Button(self.alert_bar, text="X", command=lambda:self.alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
         self.alert_bar.pack_forget()
 
-        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.3)",
+        ttk.Label(self, text="Calendario FEAGA / FEADER – Editor y pagos (v1.2.4)",
                   font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,5), anchor="w")
 
         split=ttk.Panedwindow(self, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=10)
@@ -529,8 +560,11 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         items=self._effective_today_items()
         if items:
             tipos=", ".join(sorted({i["tipo"] for i in items if not i["tipo"].startswith("Sin pagos")}))
-            self.alert_msg.config(text=f"Hoy ({date.today().strftime('%d/%m/%Y')}) hay pagos FEAGA: {tipos}.")
-            self.alert_bar.pack(fill="x", padx=10, pady=(10,0))
+            if tipos:
+                self.alert_msg.config(text=f"Hoy ({date.today().strftime('%d/%m/%Y')}) hay pagos FEAGA: {tipos}.")
+                self.alert_bar.pack(fill="x", padx=10, pady=(10,0))
+            else:
+                self.alert_bar.pack_forget()
         else:
             self.alert_bar.pack_forget()
 
@@ -584,8 +618,8 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 
     def _remember_and_show(self, dt: date):
         self.current_selected_date = dt  # respaldo
+        # Combina concretos + heurística, deduplicando
         items = self.index.get_day(dt) + self.heur.get_for_day(dt)
-        # deduplicar
         seen=set(); uniq=[]
         for it in items:
             key=(it["tipo"],it["fondo"],it["detalle"])
@@ -594,10 +628,22 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
         self.pay_frame.show(dt, uniq)
 
     def _show_selected_date_payments(self):
+        # Asegura selección coherente con el año visible
+        self.yearcal.ensure_selection_in_current_year()
+
         dt = self.yearcal.get_selected_date() or self.current_selected_date
         if not dt:
             messagebox.showinfo("Calendario","Selecciona primero un día del calendario.")
             return
+
+        # Si no hay pagos concretos indexados en esa fecha, avisamos (aunque se muestre la heurística)
+        concrete = self.index.get_day(dt)
+        if not concrete:
+            messagebox.showinfo(
+                "Pagos",
+                "No hay pagos concretos indexados para la fecha seleccionada.\n"
+                "Se muestran, si proceden, referencias heurísticas generales."
+            )
         self._remember_and_show(dt)
 
     def _insert_date_in_activity(self,y,m,d):
@@ -694,7 +740,7 @@ class CalendarioFEAGA_FEADERFrame(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Editor Calendario FEAGA/FEADER (v1.2.3)")
+    root.title("Editor Calendario FEAGA/FEADER (v1.2.4)")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
