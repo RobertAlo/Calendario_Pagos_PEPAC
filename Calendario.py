@@ -1,43 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v2.1.0
-- Elimino el panel izquierdo vacío: los botones “Pagos de hoy” y “Mostrar pagos del mes” van a una barra superior.
-- Calendario y panel de pagos ocupan TODO el ancho (sin huecos).
-- Se mantiene: toggle por día, “Mostrar pagos del mes”, scraping/ingestor opcionales, pestaña Índice, popups modales propios.
-
-Opcionales:
-    pip install requests PyPDF2
+Calendario FEAGA/FEADER – v3.0.1 (SQLite thread-safe + UI mejorada)
+Corrección crítica:
+- La BD SQLite ahora se abre con check_same_thread=False y TODAS las operaciones
+  se protegen con un Lock, para que el hilo de scraping web pueda escribir sin romper.
+- La capa PaymentsDB ya no muestra messageboxes (nunca invocar Tk desde hilos).
+Resto: igual que v3.0.0 (persistencia, colores, filtros, menú contextual, etc.)
 """
 
 import calendar
-import json
 import re
+import sqlite3
 import threading
-from datetime import date, timedelta, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
-
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, messagebox
 
 # -------------------- Utilidades --------------------
+DB_FILE = "pagos_pepac.sqlite3"
+
 SPANISH_MONTHS = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
     "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
     "noviembre":11,"diciembre":12
 }
-def parse_spanish_date(text, default_year=None):
-    text = text.strip().lower()
-    m = re.search(r"\b(\d{1,2})\s*(?:de\s*)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(?:\s*de\s*(\d{4}))?\b", text)
-    if m:
-        d, mes, y = int(m.group(1)), SPANISH_MONTHS[m.group(2)], (int(m.group(3)) if m.group(3) else default_year or date.today().year)
-        return (y, mes, d)
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", text)
-    if m:
-        d, mes = int(m.group(1)), int(m.group(2))
-        y = int(m.group(3)) if m.group(3) else (default_year or date.today().year)
-        if y < 100: y += 2000
-        return (y, mes, d)
-    return None
+
+def parse_ddmmyyyy(s: str) -> date | None:
+    s = s.strip()
+    if not s: return None
+    try: return datetime.strptime(s, "%d/%m/%Y").date()
+    except Exception: return None
+
+def iso(d: date) -> str: return d.strftime("%Y-%m-%d")
 
 def daterange(d1: date, d2: date):
     cur = d1
@@ -45,73 +40,124 @@ def daterange(d1: date, d2: date):
         yield cur
         cur += timedelta(days=1)
 
-def parse_ddmmyyyy(s: str):
-    s = s.strip()
-    if not s: return None
-    try:
-        return datetime.strptime(s, "%d/%m/%Y").date()
-    except Exception:
-        return None
+# -------------------- Capa de datos (SQLite, segura para hilos) --------------------
+class PaymentsDB:
+    def __init__(self, path: str = DB_FILE):
+        # Permitir uso desde hilos + lock de proceso
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        self._ensure_schema()
 
-# -------------------- Índice de pagos (reales) --------------------
-class PaymentsIndex:
-    def __init__(self): self._by_date = {}
-    def clear(self): self._by_date.clear()
-    def add(self, dt: date, tipo: str, fondo: str, detalle: str, fuente: str = ""):
-        self._by_date.setdefault(dt, []).append({"tipo":tipo,"fondo":fondo,"detalle":detalle,"fuente":fuente})
+    def _ensure_schema(self):
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pagos (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fecha     TEXT NOT NULL,              -- ISO YYYY-MM-DD
+                    tipo      TEXT NOT NULL,
+                    fondo     TEXT NOT NULL,
+                    detalle   TEXT NOT NULL,
+                    fuente    TEXT DEFAULT '',
+                    origen    TEXT NOT NULL CHECK (origen IN ('manual','web','heuristica')),
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_unique
+                ON pagos (fecha, tipo, fondo, detalle, origen)
+            """)
+            self.conn.commit()
+
+    # CRUD (sin UI)
+    def add(self, d: date, tipo: str, fondo: str, detalle: str, fuente: str = "", origen: str = "manual"):
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO pagos (fecha,tipo,fondo,detalle,fuente,origen) VALUES (?,?,?,?,?,?)",
+                (iso(d), tipo.strip(), fondo.strip(), detalle.strip(), fuente.strip(), origen)
+            )
+            self.conn.commit()
+
     def add_range(self, d1: date, d2: date, **kwargs):
-        for dt in daterange(d1,d2): self.add(dt, **kwargs)
-    def get_day(self, dt: date): return list(self._by_date.get(dt, []))
-    def has_day(self, dt: date) -> bool: return bool(self._by_date.get(dt))
-    def iter_all(self):
-        for dt in sorted(self._by_date.keys()):
-            for it in self._by_date[dt]:
-                yield dt, it
-    # Persistencia JSON
-    def to_dict(self):
-        out={}
-        for dt, items in self._by_date.items():
-            out[dt.isoformat()] = items
-        return out
-    def from_dict(self, data: dict):
-        self._by_date.clear()
-        for k, items in data.items():
-            try:
-                dt = datetime.fromisoformat(k).date()
-            except Exception:
-                continue
-            self._by_date[dt] = list(items)
-    def save_json(self, path: Path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-    def load_json(self, path: Path):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.from_dict(data)
+        with self._lock:
+            cur = self.conn.cursor()
+            for d in daterange(d1,d2):
+                cur.execute(
+                    "INSERT OR IGNORE INTO pagos (fecha,tipo,fondo,detalle,fuente,origen) VALUES (?,?,?,?,?,?)",
+                    (iso(d), kwargs.get("tipo",""), kwargs.get("fondo",""),
+                     kwargs.get("detalle",""), kwargs.get("fuente",""), kwargs.get("origen","manual"))
+                )
+            self.conn.commit()
 
-# -------------------- Heurística FEAGA --------------------
-class HeuristicPaymentsProvider:
-    def get_for_day(self, dt: date):
-        y, m = dt.year, dt.month
-        campaign_year = y if m >= 10 else y - 1
-        start_ant = date(campaign_year, 10, 16); end_ant = date(campaign_year, 11, 30)
-        start_sal = date(campaign_year, 12, 1);  end_sal = date(campaign_year + 1, 6, 30)
-        out = []
-        if start_ant <= dt <= end_ant:
-            out.append({"tipo":"Anticipo ayudas directas","fondo":"FEAGA",
-                        "detalle":f"Hasta el 70% campaña {campaign_year}. Ventana 16/10–30/11.",
-                        "fuente":"Heurística FEGA"})
-        if (start_sal <= dt <= date(campaign_year,12,31)) or (date(campaign_year+1,1,1) <= dt <= end_sal):
-            out.append({"tipo":"Saldo ayudas directas","fondo":"FEAGA",
-                        "detalle":f"Hasta el 30% restante campaña {campaign_year}. Ventana 01/12–30/06 (año+1).",
-                        "fuente":"Heurística FEGA"})
-        if not out:
-            out.append({"tipo":"Sin pagos FEAGA generales","fondo":"—",
-                        "detalle":"Fuera de ventanas de anticipo/saldo. Revise resoluciones específicas.",
-                        "fuente":"Heurística FEGA"})
-        return out
+    def delete_day(self, d: date, origen: str | None = None):
+        with self._lock:
+            if origen:
+                self.conn.execute("DELETE FROM pagos WHERE fecha=? AND origen=?", (iso(d), origen))
+            else:
+                self.conn.execute("DELETE FROM pagos WHERE fecha=?", (iso(d),))
+            self.conn.commit()
 
-# -------------------- Scraper / Ingestor (opcionales) --------------------
+    def delete_all(self, include_heuristic: bool = True):
+        with self._lock:
+            if include_heuristic:
+                self.conn.execute("DELETE FROM pagos")
+            else:
+                self.conn.execute("DELETE FROM pagos WHERE origen IN ('manual','web')")
+            self.conn.commit()
+
+    def get_day(self, d: date, origins: set[str] | None = None) -> list[dict]:
+        with self._lock:
+            q = "SELECT * FROM pagos WHERE fecha=?"
+            args = [iso(d)]
+            if origins:
+                q += f" AND origen IN ({','.join('?'*len(origins))})"
+                args += list(origins)
+            q += " ORDER BY origen DESC, tipo"
+            rows = self.conn.execute(q, args).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_month(self, y: int, m: int, origins: set[str] | None = None) -> list[dict]:
+        d1 = date(y,m,1)
+        d2 = date(y,m,calendar.monthrange(y,m)[1])
+        return self.get_range(d1, d2, origins)
+
+    def get_range(self, d1: date, d2: date, origins: set[str] | None = None) -> list[dict]:
+        with self._lock:
+            q = "SELECT * FROM pagos WHERE date(fecha) BETWEEN date(?) AND date(?)"
+            args = [iso(d1), iso(d2)]
+            if origins:
+                q += f" AND origen IN ({','.join('?'*len(origins))})"
+                args += list(origins)
+            q += " ORDER BY fecha, origen DESC, tipo"
+            rows = self.conn.execute(q, args).fetchall()
+            return [dict(r) for r in rows]
+
+    def has_day(self, d: date) -> bool:
+        with self._lock:
+            r = self.conn.execute("SELECT 1 FROM pagos WHERE fecha=? LIMIT 1", (iso(d),)).fetchone()
+            return bool(r)
+
+# -------------------- Heurística FEAGA (se guarda en BD) --------------------
+class HeuristicSeeder:
+    @staticmethod
+    def campaign_year_for(d: date) -> int:
+        return d.year if d.month >= 10 else d.year - 1
+
+    @staticmethod
+    def seed_for_campaign(db: PaymentsDB, campaign_year: int):
+        ant1 = date(campaign_year, 10, 16); ant2 = date(campaign_year, 11, 30)
+        sal1 = date(campaign_year, 12, 1);  sal2 = date(campaign_year+1, 6, 30)
+        db.add_range(ant1, ant2,
+                     tipo="Anticipo ayudas directas", fondo="FEAGA",
+                     detalle=f"Ventana general de anticipos. Campaña {campaign_year}.",
+                     fuente="Heurística FEGA", origen="heuristica")
+        db.add_range(sal1, sal2,
+                     tipo="Saldo ayudas directas", fondo="FEAGA",
+                     detalle=f"Ventana general de saldos. Campaña {campaign_year}.",
+                     fuente="Heurística FEGA", origen="heuristica")
+
+# -------------------- Scraper web (opcional) --------------------
 class FegaWebScraper:
     NOTE_URLS = [
         "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf",
@@ -119,78 +165,37 @@ class FegaWebScraper:
         "https://www.fega.gob.es/sites/default/files/files/document/241115_NOTA_WEB_EERR_PRIMER_SALDO_Ca_2024_def.pdf",
     ]
     def __init__(self):
-        try: import requests  # noqa
-        except Exception: self._ok=False
-        else: self._ok=True
+        try:
+            import requests  # noqa
+        except Exception:
+            self._ok = False
+        else:
+            self._ok = True
     def available(self): return self._ok
-    def fetch_into_index(self, index: PaymentsIndex, year_hint:int|None=None):
-        if not self._ok: raise RuntimeError("Falta 'requests'.")
+
+    def fetch_into_db(self, db: PaymentsDB, year_hint: int | None = None):
+        """Descarga y vuelca 'ventanas' típicas marcadas como origen 'web'."""
+        if not self._ok:
+            raise RuntimeError("Falta 'requests' (pip install requests).")
         import requests
         for url in self.NOTE_URLS:
             try:
                 r = requests.get(url, timeout=15)
-                txt = r.content.decode("latin-1", errors="ignore") if r.status_code==200 else url
+                content = r.content.decode("latin-1", errors="ignore") if r.status_code == 200 else url
             except Exception:
-                txt = url
-            m = re.search(r"(20\d{2})", txt)
+                content = url
+            m = re.search(r"(20\d{2})", content)
             y = int(m.group(1)) if m else (year_hint or date.today().year)
-            ant1 = parse_spanish_date("16 de octubre", y); ant2 = parse_spanish_date("30 de noviembre", y)
-            sal1 = parse_spanish_date("1 de diciembre", y); sal2 = parse_spanish_date("30 de junio", y+1)
-            if ant1 and ant2:
-                index.add_range(date(*ant1), date(*ant2),
-                                tipo="Anticipo ayudas directas", fondo="FEAGA",
-                                detalle="Ventana general de anticipos (nota FEGA).", fuente=url)
-            if sal1 and sal2:
-                index.add_range(date(*sal1), date(*sal2),
-                                tipo="Saldo ayudas directas", fondo="FEAGA",
-                                detalle="Ventana general de saldos (nota FEGA).", fuente=url)
-
-class FegaPDFIngestor:
-    def __init__(self):
-        try: import PyPDF2  # noqa
-        except Exception: self._ok=False
-        else: self._ok=True
-    def available(self): return self._ok
-    def _extract_text(self, path: Path) -> str:
-        import PyPDF2
-        txt=[]
-        try:
-            with open(path,"rb") as fh:
-                reader=PyPDF2.PdfReader(fh)
-                for p in reader.pages:
-                    try: txt.append(p.extract_text() or "")
-                    except Exception: pass
-        except Exception: return ""
-        return "\n".join(txt)
-    def ingest_folder(self, folder: Path, index: PaymentsIndex, default_year:int|None=None):
-        if not self._ok: raise RuntimeError("Falta 'PyPDF2'.")
-        folder = Path(folder)
-        if not folder.exists(): raise FileNotFoundError(str(folder))
-        for pdf in folder.glob("*.pdf"):
-            text = self._extract_text(pdf).lower()
-            if not text: continue
-            m = re.search(r"(20\d{2})", text)
-            y = int(m.group(1)) if m else (default_year or date.today().year)
-            for mo in re.finditer(r"del\s+(\d{1,2})\s+al\s+(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)", text):
-                d1,d2,mes = int(mo.group(1)), int(mo.group(2)), SPANISH_MONTHS[mo.group(3)]
-                ctx = text[max(0,mo.start()-120):mo.end()+120]
-                etiqueta,fondo="Pago/ventana","—"
-                if "anticipo" in ctx: etiqueta,fondo="Anticipo ayudas directas","FEAGA"
-                elif "saldo" in ctx: etiqueta,fondo="Saldo ayudas directas","FEAGA"
-                elif "feader" in ctx: etiqueta,fondo="Pago medidas desarrollo rural","FEADER"
-                index.add_range(date(y,mes,d1), date(y,mes,d2),
-                                tipo=etiqueta, fondo=fondo,
-                                detalle=f"Ventana detectada en {pdf.name}", fuente=str(pdf))
-            for mo in re.finditer(r"\b(\d{1,2})\s*(?:de\s*)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b", text):
-                d, mes = int(mo.group(1)), SPANISH_MONTHS[mo.group(2)]
-                ctx = text[max(0,mo.start()-140):mo.end()+140]
-                etiqueta,fondo=None,"—"
-                if "anticipo" in ctx: etiqueta,fondo="Anticipo ayudas directas","FEAGA"
-                elif "saldo" in ctx: etiqueta,fondo="Saldo ayudas directas","FEAGA"
-                elif "pago" in ctx and "feader" in ctx: etiqueta,fondo="Pago medidas desarrollo rural","FEADER"
-                if etiqueta:
-                    index.add(date(y,mes,d), tipo=etiqueta, fondo=fondo,
-                              detalle=f"Fecha mencionada en {pdf.name}", fuente=str(pdf))
+            ant1 = date(y, 10, 16); ant2 = date(y, 11, 30)
+            sal1 = date(y, 12, 1);  sal2 = date(y+1, 6, 30)
+            db.add_range(ant1, ant2,
+                         tipo="Anticipo ayudas directas", fondo="FEAGA",
+                         detalle="Ventana general de anticipos (nota FEGA).",
+                         fuente=url, origen="web")
+            db.add_range(sal1, sal2,
+                         tipo="Saldo ayudas directas", fondo="FEAGA",
+                         detalle="Ventana general de saldos (nota FEGA).",
+                         fuente=url, origen="web")
 
 # -------------------- Scroll contenedor --------------------
 class VerticalScrolledFrame(ttk.Frame):
@@ -226,28 +231,23 @@ class YearCalendarFrame(ttk.Frame):
     MESES_ES=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
     DIAS=["L","M","X","J","V","S","D"]
 
-    def __init__(self, master, year=None, on_date_change=None, on_date_double_click=None,
-                 on_day_click=None, has_events_predicate=None):
+    def __init__(self, master, year=None, on_day_toggle=None, on_day_month=None, on_day_context=None,
+                 has_events_predicate=None):
         super().__init__(master)
         calendar.setfirstweekday(calendar.MONDAY)
         self.current_year = year or date.today().year
-        self.on_date_change = on_date_change
-        self.on_date_double_click = on_date_double_click
-        self.on_day_click = on_day_click
+        self.on_day_toggle = on_day_toggle
+        self.on_day_month = on_day_month
+        self.on_day_context = on_day_context
         self.has_events_predicate = has_events_predicate or (lambda y,m,d: False)
 
-        if self.current_year == date.today().year:
-            init = f"{self.current_year:04d}-{date.today().month:02d}-{date.today().day:02d}"
-        else:
-            init = f"{self.current_year:04d}-01-01"
+        init = f"{self.current_year:04d}-{date.today().month:02d}-{date.today().day:02d}" \
+               if self.current_year == date.today().year else f"{self.current_year:04d}-01-01"
         self.sel_var = tk.StringVar(value=init)
-        self.sel_var.trace_add('write', lambda *args: self._notify_change())
 
         self._styles(); self._controls()
-
         self.scroll = VerticalScrolledFrame(self); self.scroll.grid(row=1,column=0,sticky="nsew")
         self.rowconfigure(1,weight=1); self.columnconfigure(0,weight=1)
-
         self._grid_year()
 
     def _styles(self):
@@ -266,12 +266,10 @@ class YearCalendarFrame(ttk.Frame):
         spin.bind("<FocusOut>", lambda e:self._set(self.year_var.get()))
         ttk.Button(top,text=">>",width=3,command=self._next).grid(row=0,column=2,padx=(4,8))
         ttk.Button(top,text="Hoy",command=self._go_today).grid(row=0,column=3)
-        self.info=ttk.Label(top,text="(clic=toggle pagos · doble clic=insertar)")
+        self.info=ttk.Label(top,text="(clic=toggle día · clic derecho=menú · doble clic=mes)")
         self.info.grid(row=0,column=5,sticky="e")
 
-    def refresh(self):
-        self._grid_year()
-        self.ensure_selection_in_current_year()
+    def refresh(self): self._grid_year()
 
     def _grid_year(self):
         for ch in self.scroll.inner.winfo_children(): ch.destroy()
@@ -282,7 +280,6 @@ class YearCalendarFrame(ttk.Frame):
             r,c=(month-1)//3,(month-1)%3
             self._month(grid,self.current_year,month).grid(row=r,column=c,padx=4,pady=4,sticky="nsew")
         self.scroll.inner.rowconfigure(0,weight=1); self.scroll.inner.columnconfigure(0,weight=1)
-        self._notify_change()
 
     def _month(self,parent,year,month):
         f=ttk.Frame(parent,borderwidth=1,relief="solid",padding=(4,3,4,4))
@@ -292,7 +289,7 @@ class YearCalendarFrame(ttk.Frame):
 
         weeks=calendar.monthcalendar(year,month)
         font_norm=("Segoe UI",9); font_bold=("Segoe UI",9,"bold")
-        color_weekend="#b00000"; color_event="#084f8a"
+        color_weekend="#b00000"; color_event="#0a66c2"
 
         for r,week in enumerate(weeks,start=2):
             for c in range(7):
@@ -302,21 +299,26 @@ class YearCalendarFrame(ttk.Frame):
                 has=self.has_events_predicate(year,month,day)
                 is_weekend = (c in (5,6))
                 cfg = {"font": (font_bold if has else font_norm), "bd":1, "relief":"raised",
-                       "highlightthickness":0, "indicatoron":0, "takefocus":0}
+                       "highlightthickness":0, "indicatoron":0, "takefocus":0, "width":3,
+                       "bg":"#eef5ff" if has else "#f6f6f6", "activebackground":"#dde8ff",
+                       "selectcolor":"#dde8ff"}
                 if is_weekend: cfg["fg"]=color_weekend
                 elif has: cfg["fg"]=color_event
                 val=f"{year:04d}-{month:02d}-{day:02d}"
                 rb = tk.Radiobutton(f, text=str(day), value=val, variable=self.sel_var, **cfg)
                 rb.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
 
-                def _on_release(e=None, v=val, y=year, m=month, d=day):
-                    was_same = (self.sel_var.get() == v)
-                    self.sel_var.set(v)  # si cambia -> on_date_change; si era el mismo -> toggle
-                    if was_same and callable(self.on_day_click):
-                        self.on_day_click(y,m,d)
-                rb.bind("<ButtonRelease-1>", _on_release)
-
-                rb.bind("<Double-Button-1>", lambda e,y=year,m=month,d=day:self._dbl(y,m,d))
+                def _on_click(e=None, v=val, y=year, m=month, d=day):
+                    if self.sel_var.get() == v:
+                        if callable(self.on_day_toggle): self.on_day_toggle(date(y,m,d), toggle_clear=True)
+                    else:
+                        self.sel_var.set(v)
+                        if callable(self.on_day_toggle): self.on_day_toggle(date(y,m,d), toggle_clear=False)
+                rb.bind("<ButtonRelease-1>", _on_click)
+                rb.bind("<Double-Button-1>", lambda e,y=year,m=month,d=day:
+                        (callable(self.on_day_month) and self.on_day_month(date(y,m,d))))
+                rb.bind("<Button-3>", lambda e,y=year,m=month,d=day:
+                        (callable(self.on_day_context) and self.on_day_context(e, date(y,m,d))))
 
         for c in range(7): f.columnconfigure(c,weight=1,uniform="d")
         f.grid_rowconfigure(0,minsize=18); f.grid_rowconfigure(1,minsize=18)
@@ -326,416 +328,371 @@ class YearCalendarFrame(ttk.Frame):
     def go_to_date(self, dt: date):
         self._set(dt.year)
         self.sel_var.set(f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}")
-    def get_selected_date(self):
+
+    def get_selected_date(self) -> date | None:
         val=self.sel_var.get()
-        if not val: return None
         try:
             y,m,d = map(int, val.split("-"))
             return date(y,m,d)
         except Exception:
             return None
-    def ensure_selection_in_current_year(self):
-        val = self.sel_var.get()
-        try:
-            y, m, d = map(int, val.split("-"))
-        except Exception:
-            if self.current_year == date.today().year:
-                y, m, d = self.current_year, date.today().month, date.today().day
-            else:
-                y, m, d = self.current_year, 1, 1
-            self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
-            return
-        if y != self.current_year:
-            last_day = calendar.monthrange(self.current_year, m)[1]
-            d = min(d, last_day)
-            self.sel_var.set(f"{self.current_year:04d}-{m:02d}-{d:02d}")
 
-    def _notify_change(self):
-        val=self.sel_var.get()
-        if not val: return
-        try:
-            y,m,d = map(int, val.split("-"))
-        except Exception:
-            return
-        self.info.config(text=f"Seleccionado: {d:02d}/{m:02d}/{y}  (clic=toggle · doble clic=insertar)")
-        if callable(self.on_date_change): self.on_date_change(y,m,d)
-    def _dbl(self,y,m,d):
-        self.sel_var.set(f"{y:04d}-{m:02d}-{d:02d}")
-        if callable(self.on_date_double_click): self.on_date_double_click(y,m,d)
     def _set(self,year):
         try: year=int(year)
         except: year=self.current_year
         year=max(1900,min(2100,year))
         self.current_year=year; self.year_var.set(year); self._grid_year()
-        self.ensure_selection_in_current_year()
     def _prev(self): self._set(self.current_year-1)
     def _next(self): self._set(self.current_year+1)
     def _go_today(self): self.go_to_date(date.today())
 
-# -------------------- Mini-frame de pagos --------------------
-# -------------------- Mini-frame de pagos (sin selección) --------------------
+# -------------------- Panel de pagos --------------------
 class PaymentsInfoFrame(ttk.Frame):
     def __init__(self, master):
-        super().__init__(master, padding=(6,4,6,4))
-        top = ttk.Frame(self); top.grid(row=0, column=0, sticky="ew")
-        ttk.Label(top, text="Pagos en la fecha seleccionada", font=("Segoe UI", 10, "bold")).pack(side="left")
-        # título dinámico derecha (fecha/mes + conteo)
-        self.date_lbl = ttk.Label(top, text="—")
-        self.date_lbl.pack(side="right")
+        super().__init__(master,padding=(8,6,8,6), style="Pane.TFrame")
+        head = tk.Frame(self, bg="#e6f0ff", highlightbackground="#cddcfb", highlightthickness=1)
+        tk.Label(head, text="Pagos", bg="#e6f0ff", fg="#093a76",
+                 font=("Segoe UI",10,"bold")).pack(side="left", padx=6, pady=3)
+        self.title_lbl = tk.Label(head, text="—", bg="#e6f0ff", fg="#093a76")
+        self.title_lbl.pack(side="right", padx=6)
+        head.grid(row=0,column=0,columnspan=2,sticky="ew",pady=(0,6))
 
-        cols = ("fecha", "tipo", "fondo", "detalle", "fuente")
-        # 👉 clave: desactivar selección visual
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="none")
-        headers = {"fecha": (92, "w"), "tipo": (180, "w"), "fondo": (80, "w"), "detalle": (640, "w"), "fuente": (240, "w")}
-        for c, (w, anc) in headers.items():
-            self.tree.heading(c, text=c.capitalize()); self.tree.column(c, width=w, anchor=anc, stretch=True)
+        legend = ttk.Frame(self); legend.grid(row=1, column=0, columnspan=2, sticky="w")
+        self._legend(legend, "#e8fff3", "Manual"); self._legend(legend, "#fff7e6", "Web"); self._legend(legend, "#eef5ff", "Heurística")
 
-        self.tree.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
-        ysb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        xsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        ysb.grid(row=1, column=1, sticky="ns"); xsb.grid(row=2, column=0, sticky="ew")
-        self.grid_rowconfigure(1, weight=1); self.grid_columnconfigure(0, weight=1)
+        cols=("fecha","tipo","fondo","detalle","origen","fuente")
+        self.tree=ttk.Treeview(self,columns=cols,show="headings",selectmode="none",style="Colored.Treeview")
+        headers={"fecha":(92,"w"),"tipo":(180,"w"),"fondo":(80,"w"),"detalle":(560,"w"),"origen":(88,"center"),"fuente":(220,"w")}
+        for c,(w,anc) in headers.items():
+            self.tree.heading(c,text=c.capitalize()); self.tree.column(c,width=w,anchor=anc,stretch=True)
+        self.tree.grid(row=2,column=0,sticky="nsew")
+        ysb=ttk.Scrollbar(self,orient="vertical",command=self.tree.yview)
+        xsb=ttk.Scrollbar(self,orient="horizontal",command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ysb.set,xscrollcommand=xsb.set)
+        ysb.grid(row=2,column=1,sticky="ns"); xsb.grid(row=3,column=0,sticky="ew")
+        self.grid_rowconfigure(2,weight=1); self.grid_columnconfigure(0,weight=1)
+        self.tree.tag_configure("manual", background="#e8fff3")
+        self.tree.tag_configure("web", background="#fff7e6")
+        self.tree.tag_configure("heuristica", background="#eef5ff")
+        ttk.Label(self,text="Nota: FEAGA 16/10–30/11 (anticipos), 01/12–30/06 (saldos).",
+                  foreground="#666").grid(row=4,column=0,columnspan=2,sticky="w",pady=(6,0))
 
-        ttk.Label(
-            self,
-            text="Nota: FEAGA 16/10–30/11 (anticipos), 01/12–30/06 (saldos). FEADER según resoluciones.",
-            foreground="#444"
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-    def _set_title(self, base: str, n: int | None = None):
-        # Muestra “Día 17/05/2025 · 2 pagos” o “Mes 05/2025 · 0 pagos”
-        suffix = (f" · {n} pago{'s' if (n or 0) != 1 else ''}" if n is not None else "")
-        self.date_lbl.config(text=f"{base}{suffix}")
+    @staticmethod
+    def _legend(parent, color, text):
+        box = tk.Frame(parent, bg=color, width=16, height=12, highlightthickness=1, highlightbackground="#aaa")
+        box.pack(side="left", padx=(6,4), pady=(0,4))
+        ttk.Label(parent, text=text).pack(side="left", padx=(0,10))
 
     def clear(self, title="—"):
-        self._set_title(title, 0)
+        self.title_lbl.config(text=title)
         self.tree.delete(*self.tree.get_children())
         self.update_idletasks()
 
-    def show_list(self, title: str, rows: list[dict]):
-        self._set_title(title, len(rows))
+    def show_rows(self, title: str, rows: list[dict]):
+        self.title_lbl.config(text=f"{title} · {len(rows)} pago{'s' if len(rows)!=1 else ''}")
         self.tree.delete(*self.tree.get_children())
-        for it in rows:
-            self.tree.insert("", "end", values=(it.get("fecha", ""), it["tipo"], it["fondo"], it["detalle"], it.get("fuente", "")))
+        for r in rows:
+            vals=(r.get("fecha",""), r["tipo"], r["fondo"], r["detalle"], r.get("origen",""), r.get("fuente",""))
+            self.tree.insert("", "end", values=vals, tags=(r.get("origen",""),))
         self.update_idletasks()
-
-    def show_day(self, dt: date, items: list[dict]):
-        rows = []
-        for it in items:
-            row = dict(it); row["fecha"] = dt.strftime("%d/%m/%Y"); rows.append(row)
-        self.show_list(dt.strftime("Día %d/%m/%Y"), rows)
-
-    def show_month(self, y: int, m: int, dated_items: list[tuple[date, dict]]):
-        rows = []
-        for d, it in dated_items:
-            row = dict(it); row["fecha"] = d.strftime("%d/%m/%Y"); rows.append(row)
-        self.show_list(f"Mes {m:02d}/{y}", rows)
-
 
 # -------------------- App principal --------------------
-class CalendarioFEAGA_FEADERFrame(tk.Frame):
+class App(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
-        self.heur = HeuristicPaymentsProvider()
-        self.index = PaymentsIndex()
-
-        self.display_state = {"mode":"none", "day":None, "month":None}  # none|day|month
-
+        self.db = PaymentsDB(DB_FILE)
+        self._setup_styles()
+        self.show_manual = tk.BooleanVar(value=True)
+        self.show_web = tk.BooleanVar(value=True)
+        self.show_heur = tk.BooleanVar(value=True)
+        HeuristicSeeder.seed_for_campaign(self.db, HeuristicSeeder.campaign_year_for(date.today()))
         self._build_ui()
+        self._show_day(date.today(), allow_empty_msg=False)
 
-        # Selección/pintado inicial: HOY (sin popup)
-        self.yearcal.go_to_date(date.today())
-        self.yearcal.ensure_selection_in_current_year()
-        self._show_day(date.today(), allow_popup=False)
-        self._update_today_banner()
-
-    # -------- Popups modales propios --------
-    def _popup(self, title, message, error=False):
-        top = tk.Toplevel(self.winfo_toplevel()); top.title(title)
-        top.transient(self.winfo_toplevel())
-        try: top.attributes("-topmost", True)
-        except Exception: pass
-        top.grab_set()
-        frm = ttk.Frame(top, padding=12); frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=message, justify="left",
-                  foreground=("#b00000" if error else "#222")).pack(fill="x", expand=True)
-        ttk.Button(frm, text="OK", command=top.destroy).pack(pady=(10,0))
-        top.update_idletasks()
+    def _setup_styles(self):
+        st = ttk.Style()
         try:
-            px = self.winfo_rootx() + (self.winfo_width()//2 - top.winfo_width()//2)
-            py = self.winfo_rooty() + (self.winfo_height()//2 - top.winfo_height()//2)
-            top.geometry(f"+{max(0,px)}+{max(0,py)}")
+            import platform
+            st.theme_use("winnative" if platform.system()=="Windows" else "clam")
         except Exception: pass
-        top.wait_window(top)
-    def _popup_info(self, title, message): self._popup(title, message, error=False)
-    def _popup_error(self, title, message): self._popup(title, message, error=True)
+        st.configure("TButton", padding=(6,3))
+        st.configure("Accent.TButton", padding=(8,4), font=("Segoe UI",9,"bold"))
+        st.configure("Pane.TFrame", background="#fafafa")
+        st.configure("Colored.Treeview", rowheight=22)
 
-    # ---- UI
     def _build_ui(self):
         self.pack(fill="both", expand=True)
+        title = tk.Frame(self, bg="#f0f7ff")
+        tk.Label(title, text="Calendario FEAGA / FEADER – v3.0.1",
+                 bg="#f0f7ff", fg="#053e7b", font=("Segoe UI",13,"bold")).pack(side="left", padx=10, pady=8)
+        title.pack(fill="x")
 
-        # Título
-        ttk.Label(self, text="Calendario FEAGA / FEADER – v2.1.0",
-                  font=("Segoe UI",13,"bold")).pack(padx=10, pady=(10,0), anchor="w")
+        topbar = tk.Frame(self, bg="#eef5ff", highlightbackground="#cddcfb", highlightthickness=1)
+        ttk.Button(topbar,text="Pagos de hoy",style="Accent.TButton",
+                   command=lambda:self._show_day(date.today(), allow_empty_msg=False)).pack(side="left", padx=(8,4), pady=6)
+        ttk.Button(topbar,text="Mostrar pagos del mes",
+                   command=self._show_month_of_selected).pack(side="left", padx=4, pady=6)
+        ttk.Button(topbar,text="Buscar rango…",
+                   command=self._show_range_dialog).pack(side="left", padx=4, pady=6)
+        ttk.Button(topbar,text="Añadir pago…",
+                   command=self._add_payment_dialog).pack(side="left", padx=12, pady=6)
+        ttk.Button(topbar,text="Borrar pagos del día…",
+                   command=self._delete_selected_day_dialog).pack(side="left", padx=4, pady=6)
 
-        # Barra superior (dos botones) — SIN panel izquierdo
-        topbar = ttk.Frame(self); topbar.pack(fill="x", padx=10, pady=(6,8))
-        ttk.Button(topbar,text="Pagos de hoy",command=self._open_today).pack(side="left")
-        ttk.Button(topbar,text="Mostrar pagos del mes",command=self._show_month_of_selected).pack(side="left", padx=(6,0))
-        ttk.Label(topbar, text="Usa el calendario (clic=toggle) o 'Mostrar pagos del mes'.",
-                  foreground="#555").pack(side="left", padx=12)
+        ttk.Label(topbar, text=" | Mostrar: ").pack(side="left", padx=(12,2))
+        ttk.Checkbutton(topbar, text="Manual", variable=self.show_manual,
+                        command=self._refresh_current_view).pack(side="left")
+        ttk.Checkbutton(topbar, text="Web", variable=self.show_web,
+                        command=self._refresh_current_view).pack(side="left")
+        ttk.Checkbutton(topbar, text="Heurística", variable=self.show_heur,
+                        command=self._refresh_current_view).pack(side="left")
 
-        # Pestañas
+        ttk.Button(topbar,text="Vaciar manual+web",
+                   command=lambda:self._clear_db(include_heur=False)).pack(side="right", padx=6, pady=6)
+        ttk.Button(topbar,text="Vaciar TODO",
+                   command=lambda:self._clear_db(include_heur=True)).pack(side="right", padx=(0,8), pady=6)
+        ttk.Button(topbar,text="Regenerar heurística",
+                   command=self._regen_heuristics).pack(side="right", padx=6, pady=6)
+        topbar.pack(fill="x")
+
         self.tabs=ttk.Notebook(self); self.tabs.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # --- Calendario
         tab_cal=ttk.Frame(self.tabs); self.tabs.add(tab_cal, text="Calendario")
         v_split=ttk.Panedwindow(tab_cal,orient="vertical"); v_split.pack(fill="both", expand=True)
 
-        # Panel de pagos (ANTES del calendario para evitar callbacks prematuros)
         self.pay_frame=PaymentsInfoFrame(v_split)
         cal_holder=ttk.Frame(v_split)
         v_split.add(cal_holder,weight=3); v_split.add(self.pay_frame,weight=2)
         try:
-            v_split.paneconfigure(cal_holder,minsize=140); v_split.paneconfigure(self.pay_frame,minsize=100)
+            v_split.paneconfigure(cal_holder,minsize=180); v_split.paneconfigure(self.pay_frame,minsize=140)
         except Exception: pass
 
-        # Herramientas del calendario
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(0,4))
         ttk.Button(tools,text="Actualizar pagos (web)",command=self._update_from_web).pack(side="left")
-        ttk.Button(tools,text="Importar circulares (PDF)…",command=self._import_pdfs).pack(side="left",padx=(6,0))
-        ttk.Button(tools,text="Guardar índice…",command=self._save_index).pack(side="right")
-        ttk.Button(tools,text="Cargar índice…",command=self._load_index).pack(side="right",padx=(6,0))
-        ttk.Button(tools,text="Vaciar pagos (mantener heurística)",command=self._reset_index_only).pack(side="right",padx=(6,0))
+        ttk.Label(tools, text="(opcional; registros quedan como 'web')", foreground="#666").pack(side="left", padx=8)
 
-        # Calendario
         self.yearcal=YearCalendarFrame(
             cal_holder, year=date.today().year,
-            on_date_change=self._on_calendar_change,
-            on_day_click=self._on_day_clicked_same,
-            on_date_double_click=None,
-            has_events_predicate=lambda y,m,d: self.index.has_day(date(y,m,d)) or any(
-                i["tipo"]!="Sin pagos FEAGA generales" for i in self.heur.get_for_day(date(y,m,d))
-            )
+            on_day_toggle=self._on_day_toggle,
+            on_day_month=lambda dt: self._show_month(dt.year, dt.month),
+            on_day_context=self._on_day_context,
+            has_events_predicate=lambda y,m,d: self.db.has_day(date(y,m,d))
         )
         self.yearcal.pack(fill="both", expand=True)
 
-        # --- Índice
         tab_idx=ttk.Frame(self.tabs); self.tabs.add(tab_idx,text="Índice")
         self._build_index_tab(tab_idx)
 
-    # ---- Pestaña "Índice"
     def _build_index_tab(self, parent):
         top=ttk.Frame(parent); top.pack(fill="x", pady=(6,4))
-        ttk.Label(top, text="Filtro texto:").pack(side="left", padx=(6,4))
-        self.idx_filter_txt = ttk.Entry(top, width=30); self.idx_filter_txt.pack(side="left", padx=(0,10))
-        ttk.Label(top, text="Desde (dd/mm/aaaa):").pack(side="left")
-        self.idx_from = ttk.Entry(top, width=12); self.idx_from.pack(side="left", padx=(4,10))
+        ttk.Label(top, text="Desde (dd/mm/aaaa):").pack(side="left", padx=(6,4))
+        self.idx_from = ttk.Entry(top, width=12); self.idx_from.pack(side="left", padx=(0,10))
         ttk.Label(top, text="Hasta:").pack(side="left")
         self.idx_to = ttk.Entry(top, width=12); self.idx_to.pack(side="left", padx=(4,10))
         ttk.Button(top, text="Refrescar", command=self._refresh_index_tab).pack(side="left")
         ttk.Button(top, text="Ir a día", command=self._goto_from_index_tab).pack(side="left", padx=(10,0))
 
-        cols=("fecha","tipo","fondo","detalle","fuente")
-        self.idx_tree=ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
-        headers={"fecha":(90,"w"),"tipo":(180,"w"),"fondo":(80,"w"),"detalle":(620,"w"),"fuente":(240,"w")}
+        cols=("fecha","tipo","fondo","detalle","origen","fuente")
+        self.idx_tree=ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse", style="Colored.Treeview")
+        headers={"fecha":(92,"w"),"tipo":(180,"w"),"fondo":(80,"w"),"detalle":(560,"w"),"origen":(88,"center"),"fuente":(220,"w")}
         for c,(w,anc) in headers.items():
             self.idx_tree.heading(c, text=c.capitalize()); self.idx_tree.column(c, width=w, anchor=anc, stretch=True)
         self.idx_tree.pack(fill="both", expand=True, padx=6, pady=(0,6))
         ysb=ttk.Scrollbar(parent, orient="vertical", command=self.idx_tree.yview)
         self.idx_tree.configure(yscrollcommand=ysb.set)
         ysb.place(in_=self.idx_tree, relx=1.0, rely=0, relheight=1.0, x=-16)
-
+        self.idx_tree.tag_configure("manual", background="#e8fff3")
+        self.idx_tree.tag_configure("web", background="#fff7e6")
+        self.idx_tree.tag_configure("heuristica", background="#eef5ff")
         self._refresh_index_tab()
 
     def _refresh_index_tab(self):
-        txt = self.idx_filter_txt.get().strip().lower()
-        d1 = parse_ddmmyyyy(self.idx_from.get()) if self.idx_from.get().strip() else None
-        d2 = parse_ddmmyyyy(self.idx_to.get()) if self.idx_to.get().strip() else None
+        d1 = parse_ddmmyyyy(self.idx_from.get()) if self.idx_from.get().strip() else date(1900,1,1)
+        d2 = parse_ddmmyyyy(self.idx_to.get()) if self.idx_to.get().strip() else date(2100,12,31)
+        rows = self.db.get_range(d1, d2, origins=None)
         self.idx_tree.delete(*self.idx_tree.get_children())
-        for dt, it in self.index.iter_all():
-            if d1 and dt < d1: continue
-            if d2 and dt > d2: continue
-            blob = f"{it.get('tipo','')} {it.get('fondo','')} {it.get('detalle','')} {it.get('fuente','')}".lower()
-            if txt and txt not in blob: continue
-            self.idx_tree.insert("", "end", values=(dt.strftime("%d/%m/%Y"), it["tipo"], it["fondo"], it["detalle"], it.get("fuente","")))
+        for r in rows:
+            vals=(r["fecha"], r["tipo"], r["fondo"], r["detalle"], r["origen"], r.get("fuente",""))
+            self.idx_tree.insert("", "end", values=vals, tags=(r["origen"],))
 
     def _goto_from_index_tab(self):
         sel = self.idx_tree.selection()
         if not sel:
-            self._popup_info("Índice", "Selecciona primero una fila del índice."); return
-        vals = self.idx_tree.item(sel[0], "values")
+            messagebox.showinfo("Índice","Selecciona una fila."); return
+        vals = self.idx_tree.item(sel[0],"values")
         try:
-            dt = datetime.strptime(vals[0], "%d/%m/%Y").date()
+            dt = datetime.strptime(vals[0], "%Y-%m-%d").date()
         except Exception:
-            self._popup_error("Índice", "No se pudo interpretar la fecha seleccionada."); return
-        for i in range(self.tabs.index("end")):
-            if self.tabs.tab(i,"text")=="Calendario": self.tabs.select(i); break
+            messagebox.showerror("Índice","Fecha inválida."); return
+        self.tabs.select(0)
         self.yearcal.go_to_date(dt)
-        self._show_day(dt, allow_popup=False)
+        self._show_day(dt, allow_empty_msg=False)
 
-    # ---- Avisos “hoy”
-    def _effective_items_for_day(self, dt: date):
-        real = self.index.get_day(dt)
-        heur = [i for i in self.heur.get_for_day(dt) if i["tipo"]!="Sin pagos FEAGA generales"]
-        seen=set(); out=[]
-        for it in real+heur:
-            key=(it["tipo"],it["fondo"],it["detalle"])
-            if key in seen: continue
-            seen.add(key); out.append(it)
-        return out, real
+    # ---- Calendar callbacks
+    def _on_day_toggle(self, dt: date, toggle_clear: bool):
+        if toggle_clear: self.pay_frame.clear("—")
+        else: self._show_day(dt, allow_empty_msg=True)
 
-    def _effective_today_items(self):
-        t = date.today()
-        items,_ = self._effective_items_for_day(t)
-        return items
+    def _on_day_context(self, ev, dt: date):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Añadir pago…", command=lambda:self._add_payment_dialog(dt))
+        menu.add_command(label="Borrar pagos del día (manual+web)…", command=lambda:self._delete_day(dt, include_heur=False))
+        menu.add_command(label="Borrar pagos del día (TODO)…", command=lambda:self._delete_day(dt, include_heur=True))
+        menu.add_separator()
+        menu.add_command(label="Ver mes", command=lambda:self._show_month(dt.year, dt.month))
+        try: menu.tk_popup(ev.x_root, ev.y_root)
+        finally: menu.grab_release()
 
-    def _update_today_banner(self):
-        items=self._effective_today_items()
-        if items:
-            tipos=", ".join(sorted({i["tipo"] for i in items}))
-            self._banner_show(f"Hoy ({date.today().strftime('%d/%m/%Y')}) hay pagos FEAGA: {tipos}.")
+    # ---- Mostrar datos
+    def _active_origins(self) -> set[str]:
+        s=set()
+        if self.show_manual.get(): s.add("manual")
+        if self.show_web.get(): s.add("web")
+        if self.show_heur.get(): s.add("heuristica")
+        return s or {"manual","web","heuristica"}
+
+    def _show_day(self, dt: date, allow_empty_msg: bool):
+        rows = self.db.get_day(dt, self._active_origins())
+        for r in rows: r["fecha"] = datetime.strptime(r["fecha"], "%Y-%m-%d").strftime("%d/%m/%Y")
+        if not rows and allow_empty_msg:
+            messagebox.showinfo("Pagos", f"No hay pagos para {dt.strftime('%d/%m/%Y')} con los filtros actuales.")
+            self.pay_frame.clear("—"); return
+        self.pay_frame.show_rows(f"Día {dt.strftime('%d/%m/%Y')}", rows)
+
+    def _show_month(self, y:int, m:int):
+        rows = self.db.get_month(y,m, self._active_origins())
+        for r in rows: r["fecha"] = datetime.strptime(r["fecha"], "%Y-%m-%d").strftime("%d/%m/%Y")
+        if not rows:
+            messagebox.showinfo("Pagos del mes", f"No hay pagos en {m:02d}/{y} con los filtros actuales.")
+            self.pay_frame.clear("—"); return
+        self.pay_frame.show_rows(f"Mes {m:02d}/{y}", rows)
+        self.tabs.select(0)
+
+    def _show_month_of_selected(self):
+        dt = self.yearcal.get_selected_date() or date.today()
+        self._show_month(dt.year, dt.month)
+
+    def _show_range_dialog(self):
+        dlg = tk.Toplevel(self); dlg.title("Buscar por rango"); dlg.transient(self.winfo_toplevel()); dlg.grab_set()
+        ttk.Label(dlg,text="Desde (dd/mm/aaaa):").grid(row=0,column=0,sticky="e",padx=6,pady=6)
+        ttk.Label(dlg,text="Hasta (dd/mm/aaaa):").grid(row=1,column=0,sticky="e",padx=6,pady=6)
+        e1=ttk.Entry(dlg,width=14); e2=ttk.Entry(dlg,width=14)
+        e1.grid(row=0,column=1,padx=6,pady=6); e2.grid(row=1,column=1,padx=6,pady=6)
+        e1.insert(0, date.today().replace(day=1).strftime("%d/%m/%Y"))
+        e2.insert(0, date.today().strftime("%d/%m/%Y"))
+        btns=ttk.Frame(dlg); btns.grid(row=2,column=0,columnspan=2,pady=8)
+        def ok():
+            d1=parse_ddmmyyyy(e1.get()); d2=parse_ddmmyyyy(e2.get())
+            if not d1 or not d2 or d1>d2:
+                messagebox.showerror("Rango","Fechas inválidas."); return
+            rows = self.db.get_range(d1,d2, self._active_origins())
+            for r in rows: r["fecha"] = datetime.strptime(r["fecha"], "%Y-%m-%d").strftime("%d/%m/%Y")
+            if not rows:
+                messagebox.showinfo("Rango","Sin resultados con los filtros actuales."); self.pay_frame.clear("—")
+            else:
+                self.pay_frame.show_rows(f"Rango {d1.strftime('%d/%m/%Y')} – {d2.strftime('%d/%m/%Y')}", rows)
+            dlg.destroy()
+        ttk.Button(btns,text="Buscar",command=ok).pack(side="left",padx=6)
+        ttk.Button(btns,text="Cancelar",command=dlg.destroy).pack(side="left",padx=6)
+        dlg.wait_window(dlg)
+
+    # ---- Altas/bajas
+    def _add_payment_dialog(self, dt: date | None = None):
+        dt = dt or (self.yearcal.get_selected_date() or date.today())
+        win=tk.Toplevel(self); win.title("Añadir pago"); win.transient(self.winfo_toplevel()); win.grab_set()
+        ttk.Label(win,text="Fecha (dd/mm/aaaa):").grid(row=0,column=0,sticky="e",padx=6,pady=4)
+        ttk.Label(win,text="Tipo:").grid(row=1,column=0,sticky="e",padx=6,pady=4)
+        ttk.Label(win,text="Fondo:").grid(row=2,column=0,sticky="e",padx=6,pady=4)
+        ttk.Label(win,text="Detalle:").grid(row=3,column=0,sticky="ne",padx=6,pady=4)
+        ttk.Label(win,text="Fuente (opcional):").grid(row=4,column=0,sticky="e",padx=6,pady=4)
+        efecha=ttk.Entry(win,width=14); efecha.insert(0, dt.strftime("%d/%m/%Y")); efecha.grid(row=0,column=1,sticky="w",padx=6,pady=4)
+        etipo=ttk.Entry(win,width=40); etipo.grid(row=1,column=1,sticky="we",padx=6,pady=4)
+        efondo=ttk.Combobox(win,values=["FEAGA","FEADER","—"],width=12); efondo.set("FEAGA"); efondo.grid(row=2,column=1,sticky="w",padx=6,pady=4)
+        tdetalle=tk.Text(win,width=60,height=5,wrap="word"); tdetalle.grid(row=3,column=1,sticky="we",padx=6,pady=4)
+        efuente=ttk.Entry(win,width=60); efuente.grid(row=4,column=1,sticky="we",padx=6,pady=4)
+        btns=ttk.Frame(win); btns.grid(row=5,column=0,columnspan=2,pady=8)
+        def ok():
+            d=parse_ddmmyyyy(efecha.get())
+            if not d: messagebox.showerror("Añadir pago","Fecha inválida."); return
+            tipo=etipo.get().strip(); fondo=efondo.get().strip() or "—"; det=tdetalle.get("1.0","end").strip()
+            if not tipo or not det: messagebox.showerror("Añadir pago","Rellena Tipo y Detalle."); return
+            self.db.add(d, tipo, fondo, det, efuente.get().strip(), origen="manual")
+            self.yearcal.refresh(); self._refresh_current_view(); win.destroy()
+        ttk.Button(btns,text="Guardar",style="Accent.TButton",command=ok).pack(side="left",padx=6)
+        ttk.Button(btns,text="Cancelar",command=win.destroy).pack(side="left",padx=6)
+        win.wait_window(win)
+
+    def _delete_day(self, dt: date, include_heur: bool):
+        if include_heur:
+            if not messagebox.askyesno("Borrar día","¿Borrar TODOS los pagos (incluida heurística) de ese día?"): return
+            self.db.delete_day(dt, origen=None)
         else:
-            self._banner_hide()
+            if not messagebox.askyesno("Borrar día","¿Borrar SOLO pagos manual+web de ese día?"): return
+            self.db.delete_day(dt, origen="manual"); self.db.delete_day(dt, origen="web")
+        self.yearcal.refresh(); self._refresh_current_view()
 
-    def _banner_show(self, text):
-        if not hasattr(self, "_alert_bar"):
-            self._alert_bar = tk.Frame(self, bg="#fff3cd", highlightbackground="#ffeeba", highlightthickness=1)
-            self._alert_msg = tk.Label(self._alert_bar, text="", bg="#fff3cd", fg="#856404", font=("Segoe UI",9,"bold"))
-            self._alert_msg.pack(side="left", padx=8, pady=4)
-            tk.Button(self._alert_bar, text="Ver hoy", command=self._open_today, relief="groove").pack(side="right", padx=6, pady=4)
-            tk.Button(self._alert_bar, text="X", command=lambda:self._alert_bar.pack_forget(), relief="flat", bg="#fff3cd").pack(side="right", padx=(0,6))
-        self._alert_msg.config(text=text); self._alert_bar.pack(fill="x", padx=10, pady=(0,6))
-    def _banner_hide(self):
-        try: self._alert_bar.pack_forget()
-        except Exception: pass
+    def _delete_selected_day_dialog(self):
+        dt = self.yearcal.get_selected_date() or date.today()
+        dlg = tk.Toplevel(self); dlg.title("Borrar pagos del día"); dlg.transient(self.winfo_toplevel()); dlg.grab_set()
+        ttk.Label(dlg,text=f"Día seleccionado: {dt.strftime('%d/%m/%Y')}").pack(padx=10,pady=(10,6))
+        ttk.Button(dlg,text="Borrar manual+web",command=lambda:(dlg.destroy(), self._delete_day(dt, include_heur=False))).pack(padx=10,pady=4)
+        ttk.Button(dlg,text="Borrar TODO (incluye heurística)",command=lambda:(dlg.destroy(), self._delete_day(dt, include_heur=True))).pack(padx=10,pady=(0,10))
+        dlg.wait_window(dlg)
 
-    def _select_calendar_tab(self):
-        for i in range(self.tabs.index("end")):
-            if self.tabs.tab(i,"text")=="Calendario":
-                self.tabs.select(i); break
+    def _clear_db(self, include_heur: bool):
+        if include_heur:
+            ok = messagebox.askyesno("Vaciar BD","¿Seguro que quieres borrar TODOS los pagos (incluida heurística)?")
+        else:
+            ok = messagebox.askyesno("Vaciar BD","¿Seguro que quieres borrar pagos MANUAL+WEB? (se conserva la heurística)")
+        if not ok: return
+        self.db.delete_all(include_heuristic=include_heur)
+        if not include_heur:
+            HeuristicSeeder.seed_for_campaign(self.db, HeuristicSeeder.campaign_year_for(date.today()))
+        self.yearcal.refresh(); self.pay_frame.clear("—"); self._refresh_index_tab()
 
-    def _open_today(self):
-        self._select_calendar_tab()
-        self.yearcal.go_to_date(date.today())
-        self._show_day(date.today(), allow_popup=False)
+    def _regen_heuristics(self):
+        HeuristicSeeder.seed_for_campaign(self.db, HeuristicSeeder.campaign_year_for(date.today()))
+        self.yearcal.refresh(); self._refresh_current_view()
+        messagebox.showinfo("Heurística","Ventanas re-generadas para la campaña actual.")
 
-    # ---- Carga desde FEGA (web/PDF)
+    def _refresh_current_view(self):
+        t = self.pay_frame.title_lbl.cget("text")
+        if t.startswith("Día "):
+            try:
+                dt = datetime.strptime(t[4:14], "%d/%m/%Y").date()
+                self._show_day(dt, allow_empty_msg=False)
+            except Exception: pass
+        elif t.startswith("Mes "):
+            try:
+                y = int(t[-4:]); m = int(t[4:6])
+                self._show_month(y,m)
+            except Exception: pass
+
+    # ---- Web (hilo + after para UI)
     def _update_from_web(self):
         def run():
             try:
-                sc=FegaWebScraper()
+                sc = FegaWebScraper()
                 if not sc.available(): raise RuntimeError("Falta 'requests'.")
-                sc.fetch_into_index(self.index, year_hint=date.today().year)
-                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(), self._refresh_index_tab(),
-                                      self._popup_info("Listo","Pagos actualizados desde FEGA (web).")))
+                sc.fetch_into_db(self.db, year_hint=date.today().year)
+                self.after(0, lambda: (self.yearcal.refresh(),
+                                       self._refresh_current_view(),
+                                       self._refresh_index_tab(),
+                                       messagebox.showinfo("Web","Pagos actualizados desde FEGA (web).")) )
             except Exception as ex:
-                self.after(0, lambda: self._popup_error("Error", f"No se pudo completar el scraping web:\n{ex}"))
+                self.after(0, lambda: messagebox.showerror("Web", f"No se pudo completar la descarga:\n{ex}"))
         threading.Thread(target=run, daemon=True).start()
-        self._popup_info("Actualizando","Buscando ventanas en notas FEGA…")
-
-    def _import_pdfs(self):
-        folder=filedialog.askdirectory(title="Selecciona la carpeta con las circulares FEGA (PDF)")
-        if not folder: return
-        def run():
-            try:
-                ing=FegaPDFIngestor()
-                if not ing.available(): raise RuntimeError("Falta 'PyPDF2'.")
-                ing.ingest_folder(Path(folder), self.index, default_year=date.today().year)
-                self.after(0, lambda:(self.yearcal.refresh(), self._update_today_banner(), self._refresh_index_tab(),
-                                      self._popup_info("Listo",f"Se importaron PDFs de {folder}")))
-            except Exception as ex:
-                self.after(0, lambda: self._popup_error("Error", f"No se pudieron importar los PDFs:\n{ex}"))
-        threading.Thread(target=run, daemon=True).start()
-        self._popup_info("Importando","Leyendo circulares PDF…")
-
-    def _save_index(self):
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")],
-                                            title="Guardar índice de pagos", initialfile="indice_pagos.json")
-        if not path: return
-        try:
-            self.index.save_json(Path(path))
-            self._popup_info("Índice", f"Índice guardado en:\n{path}")
-        except Exception as ex:
-            self._popup_error("Índice", f"No se pudo guardar el índice:\n{ex}")
-
-    def _load_index(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")],
-                                          title="Cargar índice de pagos")
-        if not path: return
-        try:
-            self.index.load_json(Path(path))
-            self.yearcal.refresh(); self._update_today_banner(); self._refresh_index_tab()
-            self._popup_info("Índice", f"Índice cargado desde:\n{path}")
-        except Exception as ex:
-            self._popup_error("Índice", f"No se pudo cargar el índice:\n{ex}")
-
-    def _reset_index_only(self):
-        self.index.clear()
-        self.yearcal.refresh(); self._update_today_banner(); self._refresh_index_tab()
-        self._popup_info("Pagos","Índice vaciado. Se mantiene la heurística (no persistente).")
-
-    # ---- Integración calendario / toggle día
-    def _on_calendar_change(self,y,m,d):
-        dt = date(y,m,d)
-        if not hasattr(self, "pay_frame"): return
-        self._show_day(dt, allow_popup=True)
-
-    def _on_day_clicked_same(self,y,m,d):
-        dt = date(y,m,d)
-        if self.display_state["mode"]=="day" and self.display_state["day"]==dt:
-            self.pay_frame.clear("—")
-            self.display_state = {"mode":"none","day":None,"month":None}
-        else:
-            self._show_day(dt, allow_popup=True)
-
-    def _show_day(self, dt: date, allow_popup: bool):
-        items, real = self._effective_items_for_day(dt)
-        if not items:
-            if allow_popup:
-                self._popup_info("Pagos", f"No hay pagos para la fecha seleccionada ({dt.strftime('%d/%m/%Y')}).")
-            self.pay_frame.clear("—")
-            self.display_state = {"mode":"none","day":None,"month":None}
-            return
-        self.pay_frame.show_day(dt, items)
-        self.display_state = {"mode":"day","day":dt,"month":None}
-
-    # ---- Resumen mensual
-    def _show_month_of_selected(self):
-        dt = self.yearcal.get_selected_date() or date.today()
-        y, m = dt.year, dt.month
-        first = date(y,m,1)
-        last_day = calendar.monthrange(y,m)[1]
-        last = date(y,m,last_day)
-        rows=[]; seen=set()
-        for d in daterange(first,last):
-            items,_ = self._effective_items_for_day(d)
-            for it in items:
-                key=(d, it["tipo"], it["fondo"], it["detalle"])
-                if key in seen: continue
-                seen.add(key); rows.append((d,it))
-        if not rows:
-            self._popup_info("Pagos del mes", f"No hay pagos en {m:02d}/{y}.")
-            self.pay_frame.clear("—")
-            self.display_state = {"mode":"none","day":None,"month":None}
-            return
-        self.pay_frame.show_month(y,m, rows)
-        self.display_state = {"mode":"month","day":None,"month":(y,m)}
-        self._select_calendar_tab()
+        messagebox.showinfo("Web","Buscando ventanas en notas FEGA…\n(Se guardarán como origen 'web').")
 
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v2.1.0")
+    root.title("Calendario FEAGA/FEADER – v3.0.1")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
     except Exception: pass
-    try:
-        import platform; ttk.Style().theme_use("winnative" if platform.system()=="Windows" else "clam")
-    except Exception: pass
-    app=CalendarioFEAGA_FEADERFrame(root); app.pack(fill="both", expand=True)
+    app=App(root); app.pack(fill="both", expand=True)
     root.mainloop()
 
 if __name__=="__main__":
