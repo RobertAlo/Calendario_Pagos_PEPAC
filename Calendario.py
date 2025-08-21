@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v3.8.0
+Calendario FEAGA/FEADER – v3.9.0
 
 Novedades:
-- Día → FEAGA/FEADER: si no hay específicos del día, añade los del mes (etiquetado claro).
-- “Hitos del mes (visual)” → cuadrícula con totales FEAGA/FEADER, chips por día, tooltip y clic a día, exportar CSV.
-- Importador específico para Excel Aragón (hoja 'Calendario' con Mes/Actividad/Ayuda FEAGA/Ayuda FEADER):
-  • Pide año destino y mapea frases tipo "1 de febrero", "Del 1 al 9 de junio", "A partir del 16 de octubre".
-  • Crea eventos FEAGA/FEADER según 'Sí', con Tipo/Detalle limpios, origen=manual, fuente="Excel Aragón (Calendario)".
-- Scraping multi-fuente: FEGA (PDF + noticias HTML). Arquitectura para añadir CCAA fácilmente.
+- Hitos del mes: ventana 100% redimensionable; cuadrícula se expande, y el texto se envuelve según tamaño.
+- Auto-carga de Excel de Aragón al arrancar (sin diálogos). Se importa 1 vez por AÑO y queda persistido en SQLite.
+- Mantiene: caída a “mes” por fondo, visual mensual con chips, scraper multi-fuente FEGA (PDF + noticias), importador genérico.
 
-Dependencias opcionales para importar/scrapear:
+Dependencias opcionales (para autoload Excel y scraper):
   pip install pandas openpyxl requests beautifulsoup4 lxml
 """
 
@@ -24,8 +21,15 @@ from tkinter import ttk, messagebox, filedialog
 from collections import defaultdict, Counter
 from contextlib import suppress
 import unicodedata
+from pathlib import Path
 
+# -------------------- Config --------------------
 DB_FILE = "pagos_pepac.sqlite3"
+
+# Ruta de auto-carga (se intenta al arrancar; si no existe o faltan dependencias, se ignora)
+AUTOLOAD_ARAGON_EXCEL = Path("/mnt/data/tabla_FEAGA_FEADER_Aragon.xlsx")
+# Fallbacks alternativos por si mueves el fichero al proyecto
+AUTOLOAD_FALLBACKS = [Path("tabla_FEAGA_FEADER_Aragon.xlsx"), Path("data/tabla_FEAGA_FEADER_Aragon.xlsx")]
 
 def iso(d: date) -> str: return d.strftime("%Y-%m-%d")
 def fmt_dmy(d: date) -> str: return d.strftime("%d/%m/%Y")
@@ -77,8 +81,27 @@ class PaymentsDB:
             """)
             c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos
                          ON pagos(fecha,tipo,fondo,detalle,origen)""")
+            # Tabla de metadatos para marcadores (por ejemplo, autoload por año)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS app_meta(
+                    k TEXT PRIMARY KEY,
+                    v TEXT
+                )
+            """)
             self.conn.commit()
 
+    # ---- metadatos ----
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            r = self.conn.execute("SELECT v FROM app_meta WHERE k=?", (key,)).fetchone()
+            return r["v"] if r else None
+
+    def set_meta(self, key: str, value: str):
+        with self._lock:
+            self.conn.execute("INSERT INTO app_meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+            self.conn.commit()
+
+    # ---- I/O pagos ----
     def add(self, d: date, tipo: str, fondo: str, detalle: str, fuente: str="", origen: str="manual"):
         with self._lock:
             self.conn.execute(
@@ -531,7 +554,7 @@ class YearCalendarFrame(ttk.Frame):
     def _next(self): self._set(self.current_year+1)
     def _go_today(self): self.go_to_date(date.today())
 
-# -------------------- Visual de Hitos del Mes --------------------
+# -------------------- Visual de Hitos del Mes (RESPONSIVE) --------------------
 class MonthHitosDialog(tk.Toplevel):
     def __init__(self, app: "App", year: int, month: int):
         super().__init__(app)
@@ -539,19 +562,26 @@ class MonthHitosDialog(tk.Toplevel):
         self.title(f"Hitos {month:02d}/{year}")
         self.transient(app.winfo_toplevel()); self.grab_set()
         self.configure(bg="#f7f9fc")
+        self.resizable(True, True)
         self._build(year, month)
 
     def _build(self, y:int, m:int):
+        # Top bar
         top = tk.Frame(self, bg="#e7f0ff", highlightbackground="#cddcfb", highlightthickness=1)
         tk.Label(top, text=f"Hitos del mes {m:02d}/{y}", bg="#e7f0ff", fg="#093a76",
                  font=("Segoe UI",11,"bold")).pack(side="left", padx=10, pady=6)
         tk.Button(top, text="Exportar mes (CSV)", command=lambda:self._export_csv(y,m)).pack(side="right", padx=8, pady=6)
-        top.pack(fill="x")
+        top.grid(row=0, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_columnconfigure(0, weight=1)
 
+        # Grid responsive
         grid = tk.Frame(self, bg="#f7f9fc")
-        grid.pack(fill="both", expand=True, padx=8, pady=8)
+        grid.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
+        self.grid_rowconfigure(1, weight=1)
 
-        leg = tk.Frame(self, bg="#f7f9fc"); leg.pack(fill="x", padx=10)
+        # Leyenda
+        leg = tk.Frame(self, bg="#f7f9fc"); leg.grid(row=2, column=0, sticky="ew", padx=10, pady=(0,6))
         def badge(color, txt):
             box=tk.Frame(leg,bg=color,width=16,height=12,highlightthickness=1,highlightbackground="#aaa")
             box.pack(side="left", padx=(6,4), pady=2)
@@ -560,31 +590,40 @@ class MonthHitosDialog(tk.Toplevel):
         badge("#eef5ff","Referencia FEAGA")
         badge("#e7f3fe","Información (del mes)")
 
+        # Datos
         month_rows = self.app.db.get_month(y, m, origins=None)
         by_day = defaultdict(list)
         for r in month_rows:
             by_day[r["fecha"]].append(r)
 
         weeks = calendar.monthcalendar(y, m)
+        rows_cnt = len(weeks)
+
+        # Configurar pesos de filas/columnas para que todo crezca
+        for rr in range(rows_cnt):
+            grid.grid_rowconfigure(rr, weight=1, uniform="rows")
+        for cc in range(7):
+            grid.grid_columnconfigure(cc, weight=1, uniform="cols")
+
+        # Construcción de celdas
         for rr, week in enumerate(weeks):
-            rowf = tk.Frame(grid, bg="#f7f9fc"); rowf.grid(row=rr, column=0, sticky="ew", pady=2)
             for cc, dd in enumerate(week):
-                cell = tk.Frame(rowf, bd=1, relief="solid", bg="#ffffff")
-                cell.pack(side="left", padx=2, pady=2)
-                cell.configure(width=170, height=110)
-                cell.pack_propagate(False)
+                cell = tk.Frame(grid, bd=1, relief="solid", bg="#ffffff")
+                cell.grid(row=rr, column=cc, padx=3, pady=3, sticky="nsew")
                 if dd == 0:
-                    tk.Label(cell, text="", bg="#ffffff").pack()
                     continue
                 dt = date(y,m,dd); iso_dt = iso(dt)
                 rows = list(by_day.get(iso_dt, []))
                 for ref in FeagaRef.day_in_any_window(dt):
                     rows.append(ref)
 
-                hdr = tk.Frame(cell, bg="#f1f6ff"); hdr.pack(fill="x")
+                # Encabezado: día
+                hdr = tk.Frame(cell, bg="#f1f6ff")
+                hdr.pack(fill="x")
                 tk.Label(hdr, text=str(dd), bg="#f1f6ff", fg="#093a76",
                          font=("Segoe UI",10,"bold")).pack(side="left", padx=6)
 
+                # Totales
                 buckets = group_by_fondo(rows)
                 line = tk.Frame(cell, bg="#ffffff"); line.pack(fill="x", padx=6, pady=(2,0))
                 feaga_n = len(buckets.get("FEAGA", []))
@@ -592,23 +631,36 @@ class MonthHitosDialog(tk.Toplevel):
                 tk.Label(line, text=f"FEAGA: {feaga_n}", bg="#ffffff").pack(side="left")
                 tk.Label(line, text=f"  FEADER: {feader_n}", bg="#ffffff").pack(side="left", padx=(8,0))
 
+                # Chips (envoltura dinámica)
                 chips = top_k_types(rows, k=3)
-                chipsf = tk.Frame(cell, bg="#ffffff"); chipsf.pack(fill="x", padx=6, pady=(4,2))
+                chipsf = tk.Frame(cell, bg="#ffffff"); chipsf.pack(fill="both", expand=True, padx=6, pady=(4,4))
+                chip_labels=[]
                 for t in chips:
-                    lab = tk.Label(chipsf, text=f"• {t}", bg="#eef5ff", fg="#093a76")
+                    lab = tk.Label(chipsf, text=f"• {t}", bg="#eef5ff", fg="#093a76", justify="left", anchor="w")
                     lab.pack(anchor="w", fill="x", pady=1)
+                    chip_labels.append(lab)
 
+                # Tooltip
                 tip = "\n".join(
-                    f"{(r.get('fondo') or '—')}: {r.get('tipo','—')} — {r.get('detalle','').strip()[:140]}"
-                    for r in rows[:8]
-                ) + ("" if len(rows)<=8 else f"\n… (+{len(rows)-8} más)")
+                    f"{(r.get('fondo') or '—')}: {r.get('tipo','—')} — {r.get('detalle','').strip()}"
+                    for r in rows[:12]
+                ) + ("" if len(rows)<=12 else f"\n… (+{len(rows)-12} más)")
                 self._bind_tooltip(cell, tip)
 
+                # Ajuste de wraplength al redimensionar
+                def _on_conf(e, labs=chip_labels):
+                    wl = max(60, e.width - 16)
+                    for lb in labs:
+                        lb.configure(wraplength=wl)
+                cell.bind("<Configure>", _on_conf)
+
+                # click a día
                 cell.bind("<Button-1>", lambda _e, dti=dt: self._goto_day(dti))
                 for w in cell.winfo_children():
                     w.bind("<Button-1>", lambda _e, dti=dt: self._goto_day(dti))
 
-        self.geometry("900x720")
+        # Mínimos razonables; el usuario puede ampliarla libremente
+        self.minsize(900, 600)
 
     def _goto_day(self, d: date):
         self.destroy()
@@ -714,6 +766,10 @@ class App(tk.Frame):
         self._build_ui()
         self._current_dt=None
         self._blink_job=None; self._blink_cycles=0
+
+        # Auto-cargar Excel Aragón (solo 1ª vez por año)
+        self._maybe_autoload_aragon_excel()
+
         self._show_day(date.today())
 
     def _setup_styles(self):
@@ -736,7 +792,7 @@ class App(tk.Frame):
         self.pack(fill="both",expand=True)
 
         title=tk.Frame(self,bg="#f0f7ff")
-        tk.Label(title,text="Calendario FEAGA / FEADER – v3.8.0",
+        tk.Label(title,text="Calendario FEAGA / FEADER – v3.9.0",
                  bg="#f0f7ff",fg="#053e7b",font=("Segoe UI",13,"bold")).pack(side="left",padx=10,pady=8)
         title.pack(fill="x")
 
@@ -1195,8 +1251,7 @@ class App(tk.Frame):
             txt = line.strip().lstrip("-").strip()
             if ":" in txt:
                 left, right = txt.split(":",1)
-                tipo = right.strip()
-                if not tipo: tipo = txt[:80]
+                tipo = right.strip() or txt[:80]
                 return (tipo, txt)
             return (txt[:80], txt)
 
@@ -1216,18 +1271,17 @@ class App(tk.Frame):
                     skipped+=1; errs.append(f"Fila {i+2}: actividad vacía"); continue
                 is_feaga = yes_col(row[c_fea]) if c_fea else False
                 is_feader= yes_col(row[c_fed]) if c_fed else False
+
+                # Sin ayudas marcadas → informativo del mes
                 if not (is_feaga or is_feader):
-                    # Si ninguna ayuda aplica, lo dejamos como informativo general del mes (—) en día 1
                     d = date(year, m, 1)
                     tipo, detalle = clean_tipo_det(act_text.splitlines()[0])
                     self.db.add(d, tipo, "—", f"[Mes] {detalle}", "Excel Aragón (Calendario)", origen="manual")
                     inserted += 1
                     continue
 
-                # Divide en líneas para detectar múltiples hitos
-                lines = [ln.strip() for ln in act_text.splitlines() if ln.strip()]
-                if not lines:
-                    lines = [act_text]
+                # Múltiples líneas/hitos
+                lines = [ln.strip() for ln in act_text.splitlines() if ln.strip()] or [act_text]
 
                 for ln in lines:
                     ln_clean = strip_accents_lower(ln)
@@ -1236,22 +1290,19 @@ class App(tk.Frame):
                     m1 = rx_del_al_de_mes.search(ln_clean)
                     if m1:
                         d1, d2, mesname = int(m1.group(1)), int(m1.group(2)), m1.group(3)
-                        mm = parse_month_name(mesname)
-                        if not mm: mm = m
-                        start = date(year, mm, d1)
-                        end = date(year, mm, d2)
+                        mm = parse_month_name(mesname) or m
+                        start = date(year, mm, d1); end = date(year, mm, d2)
                         tipo, detalle = clean_tipo_det(ln)
                         if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         inserted += (d2 - d1 + 1)
                         continue
 
-                    # 2) "Del X al Y" (mes por defecto)
+                    # 2) "Del X al Y"
                     m2 = rx_del_al.search(ln_clean)
                     if m2:
                         d1, d2 = int(m2.group(1)), int(m2.group(2))
-                        start = date(year, m, d1)
-                        end = date(year, m, d2)
+                        start = date(year, m, d1); end = date(year, m, d2)
                         tipo, detalle = clean_tipo_det(ln)
                         if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
@@ -1262,34 +1313,30 @@ class App(tk.Frame):
                     m3 = rx_a_partir_de_mes.search(ln_clean)
                     if m3:
                         d1, mesname = int(m3.group(1)), m3.group(2)
-                        mm = parse_month_name(mesname)
-                        if not mm: mm = m
-                        start = date(year, mm, d1)
-                        end = end_of_month(year, mm)
+                        mm = parse_month_name(mesname) or m
+                        start = date(year, mm, d1); end = end_of_month(year, mm)
                         tipo, detalle = clean_tipo_det(ln)
                         if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         inserted += (end - start).days + 1
                         continue
 
-                    # 4) "A partir del X" (mes por defecto)
+                    # 4) "A partir del X"
                     m4 = rx_a_partir.search(ln_clean)
                     if m4:
                         d1 = int(m4.group(1))
-                        start = date(year, m, d1)
-                        end = end_of_month(year, m)
+                        start = date(year, m, d1); end = end_of_month(year, m)
                         tipo, detalle = clean_tipo_det(ln)
                         if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
                         inserted += (end - start).days + 1
                         continue
 
-                    # 5) "X de MES" → día concreto
+                    # 5) "X de MES"
                     m5 = rx_dia_de_mes.search(ln_clean)
                     if m5:
                         d1, mesname = int(m5.group(1)), m5.group(2)
-                        mm = parse_month_name(mesname)
-                        if not mm: mm = m
+                        mm = parse_month_name(mesname) or m
                         theday = date(year, mm, d1)
                         tipo, detalle = clean_tipo_det(ln)
                         if is_feaga: self.db.add(theday, tipo, "FEAGA", detalle, "Excel Aragón (Calendario)", origen="manual")
@@ -1297,7 +1344,7 @@ class App(tk.Frame):
                         inserted += 1
                         continue
 
-                    # 6) "X" solo (número suelto) → interpretamos día del mes por defecto si el contexto lo sugiere
+                    # 6) "X" solo (si hay “:” interpretamos día)
                     m6 = rx_dia_suelto.search(ln_clean)
                     if m6 and ":" in ln:
                         try:
@@ -1311,7 +1358,7 @@ class App(tk.Frame):
                         except Exception:
                             pass
 
-                    # 7) Sin fecha explícita → anotamos día 1 del mes como marcador
+                    # 7) Sin fecha explícita → día 1
                     theday = date(year, m, 1)
                     tipo, detalle = clean_tipo_det(ln)
                     if is_feaga: self.db.add(theday, tipo, "FEAGA", f"[Mes] {detalle}", "Excel Aragón (Calendario)", origen="manual")
@@ -1322,6 +1369,54 @@ class App(tk.Frame):
                 skipped+=1; errs.append(f"Fila {i+2}: {ex}")
 
         return inserted, skipped, errs
+
+    # ---- Auto-carga al arrancar (silenciosa, 1 vez por año) ----
+    def _maybe_autoload_aragon_excel(self):
+        year = self.yearcal.current_year
+        key = f"autoload_aragon_{year}"
+        if self.db.get_meta(key):
+            return  # ya importado para este año
+
+        # Localiza fichero
+        xls_path = None
+        candidates = [AUTOLOAD_ARAGON_EXCEL, *AUTOLOAD_FALLBACKS]
+        for p in candidates:
+            if p and Path(p).exists():
+                xls_path = Path(p)
+                break
+        if not xls_path:
+            # no molestar al usuario; solo información en consola
+            self.console.show("info", "Autocarga Aragón: fichero no encontrado (se ignora).")
+            return
+
+        # Intenta importar sin diálogos
+        try:
+            import pandas as pd
+        except Exception:
+            self.console.show("warn", "Autocarga Aragón: faltan dependencias (pandas/openpyxl). Usa 'Importar Excel…'.")
+            return
+
+        try:
+            df = pd.read_excel(xls_path)
+        except Exception as ex:
+            self.console.show("warn", f"Autocarga Aragón: no se pudo leer el Excel ({ex}).")
+            return
+
+        c_mes   = self._find_col(df.columns, ["mes"])
+        c_act   = self._find_col(df.columns, ["actividad","observaciones","descripcion","descripción"])
+        c_fea   = self._find_col(df.columns, ["ayuda feaga","feaga"])
+        c_fed   = self._find_col(df.columns, ["ayuda feader","feader"])
+
+        if not (c_mes and c_act and (c_fea or c_fed)):
+            self.console.show("warn", "Autocarga Aragón: no se reconoció el formato (Mes/Actividad/FEAGA/FEADER).")
+            return
+
+        inserted, skipped, errs = self._import_aragon_calendar_df(df, c_mes, c_act, c_fea, c_fed, year)
+        self.db.set_meta(key, "ok")
+        self.yearcal.refresh(); self._refresh_current_view(); self._refresh_index_tab()
+        msg = f"Autocarga Aragón ({year}): insertados {inserted}, omitidos {skipped}."
+        if errs: msg += " (Se omitieron algunas filas por formato.)"
+        self.console.show("ok", msg)
 
     # Web (hilo seguro + messagebox)
     def _update_from_web(self):
@@ -1344,7 +1439,7 @@ class App(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v3.8.0")
+    root.title("Calendario FEAGA/FEADER – v3.9.0")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
