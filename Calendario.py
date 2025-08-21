@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v3.3.1
-- Calendario: botones tk.Button con command + <ButtonRelease-1> → SIEMPRE refresca.
-- UI sin jerga: “heurística” se muestra como “Referencia FEAGA”. Mensajes “FEAGA/FEADER”.
-- Barra de estado pastel y messagebox tras “Actualizar pagos (web)”.
-- Persistencia SQLite thread-safe.
+Calendario FEAGA/FEADER – v3.4.0
+- Calendario: tk.Button + <ButtonRelease-1> + after(0, ...) -> cada clic refresca sí o sí.
+- Botón "Limpiar panel" que además resetea la selección del calendario (por si quieres empezar de cero).
+- Terminología FEAGA en toda la UI.
+- Persistencia SQLite (thread-safe).
 """
 
 import calendar
@@ -169,7 +169,7 @@ class FeagaRef:
             rows.append({"fecha": iso(d), "tipo":"Referencia mes: Sin pagos FEAGA generales",
                          "fondo":"—", "detalle":"Fuera de ventanas de anticipo/saldo en este mes.",
                          "fuente":"Referencia FEAGA", "origen":"info"})
-        # Añadimos recordatorio FEADER también
+        # Añadimos recordatorio FEADER
         rows.append({"fecha": iso(d), "tipo": "Referencia: FEADER (desarrollo rural)",
                      "fondo":"FEADER", "detalle":"Pagos según resoluciones/convocatorias autonómicas.",
                      "fuente":"Referencia", "origen":"info"})
@@ -180,7 +180,7 @@ class FegaWebScraper:
     NOTE_URLS = [
         "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf",
         "https://www.fega.gob.es/sites/default/files/files/document/Nota_Web_AAS_Ca_2024_ANTICIPO.pdf",
-        "https://www.fega.gob.es/sites/default/files/files/document/241115_NOTA_WEB_EERR_PRIMER_SALDO_Ca_2024_def.pdf",
+        "https://www.fga.gob.es/sites/default/files/files/document/241115_NOTA_WEB_EERR_PRIMER_SALDO_Ca_2024_def.pdf".replace("fga","fega")
     ]
     def __init__(self):
         try:
@@ -211,27 +211,19 @@ class FegaWebScraper:
 
 # -------------------- StatusBar pastel --------------------
 class StatusBar(tk.Frame):
-    COLORS = {
-        "info":  ("#e6f0ff", "#093a76"),
-        "ok":    ("#eaf7ee", "#1b5e20"),
-        "warn":  ("#fff7e6", "#8a4b00"),
-        "error": ("#fdecea", "#8a1c13"),
-    }
+    COLORS = {"info":("#e6f0ff","#093a76"), "ok":("#eaf7ee","#1b5e20"),
+              "warn":("#fff7e6","#8a4b00"), "error":("#fdecea","#8a1c13")}
     def __init__(self, master):
         super().__init__(master, bg="#e6f0ff", highlightbackground="#cddcfb", highlightthickness=1)
         self._label = tk.Label(self, text="", bg="#e6f0ff", fg="#093a76", anchor="w")
         self._label.pack(fill="x", padx=10, pady=4)
         self.hide()
-
     def show(self, kind: str, text: str):
         bg, fg = self.COLORS.get(kind, self.COLORS["info"])
         self.configure(bg=bg, highlightbackground=bg)
         self._label.configure(text=text, bg=bg, fg=fg)
-        self.pack(fill="x", padx=10, pady=(6,0))
-        self.update_idletasks()
-
-    def hide(self):
-        self.pack_forget()
+        self.pack(fill="x", padx=10, pady=(6,0)); self.update_idletasks()
+    def hide(self): self.pack_forget()
 
 # -------------------- Scroll contenedor --------------------
 class VerticalScrolledFrame(ttk.Frame):
@@ -261,7 +253,7 @@ class VerticalScrolledFrame(ttk.Frame):
             else: self.canvas.yview_scroll(int(-ev.delta/40),"units")
         except Exception: pass
 
-# -------------------- Calendario con botones (solución definitiva) --------------------
+# -------------------- Calendario con botones (triple seguridad) --------------------
 class YearCalendarFrame(ttk.Frame):
     MESES_ES=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
     DIAS=["L","M","X","J","V","S","D"]
@@ -273,9 +265,7 @@ class YearCalendarFrame(ttk.Frame):
         self.on_day_click=on_day_click
         self.on_day_context=on_day_context
         self.has_events_predicate=has_events_predicate or (lambda y,m,d: False)
-
-        self._btns={}
-        self._selected=None
+        self._btns={}; self._selected=None
         self._styles(); self._controls()
         self.scroll=VerticalScrolledFrame(self); self.scroll.grid(row=1,column=0,sticky="nsew")
         self.rowconfigure(1,weight=1); self.columnconfigure(0,weight=1)
@@ -302,6 +292,12 @@ class YearCalendarFrame(ttk.Frame):
 
     def refresh(self): self._grid_year()
 
+    def clear_selection(self):
+        """Limpia selección visual y lógica (para el botón 'Limpiar panel')."""
+        if self._selected and self._selected in self._btns:
+            self._restore_style(self._selected)
+        self._selected=None
+
     def _grid_year(self):
         for ch in self.scroll.inner.winfo_children(): ch.destroy()
         self._btns.clear()
@@ -312,7 +308,6 @@ class YearCalendarFrame(ttk.Frame):
             r,c=(month-1)//3,(month-1)%3
             self._month(grid,self.current_year,month).grid(row=r,column=c,padx=4,pady=4,sticky="nsew")
         self.scroll.inner.rowconfigure(0,weight=1); self.scroll.inner.columnconfigure(0,weight=1)
-        # mantener selección si es del mismo año
         if self._selected and self._selected.year==self.current_year:
             self._highlight(self._selected)
         else:
@@ -342,12 +337,12 @@ class YearCalendarFrame(ttk.Frame):
                             font=(font_bold if has else font_norm))
                 b.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
                 dt=date(year,month,dd)
-                # Command + bind para no perder ningún clic
+                # 1) command, 2) ButtonRelease-1, 3) forzamos via after(0,...)
                 b.configure(command=lambda dti=dt: self._click_day(dti))
                 b.bind("<ButtonRelease-1>", lambda e,dti=dt: self._click_day(dti))
                 b.bind("<Double-Button-1>", lambda e,y=year,m=month: self._dbl_month(y,m))
                 b.bind("<Button-3>", lambda e,dti=dt: self._ctx(e,dti))
-                b._meta=(bg,fg,has)  # para restaurar estilo
+                b._meta=(bg,fg,has)
                 self._btns[dt]=b
 
         for c in range(7): f.columnconfigure(c,weight=1,uniform="d")
@@ -357,7 +352,7 @@ class YearCalendarFrame(ttk.Frame):
     def _restore_style(self, dt: date):
         b=self._btns.get(dt)
         if not b: return
-        bg,fg,has = b._meta
+        bg,fg,has=b._meta
         b.configure(relief="raised", bg=bg, fg=fg, font=("Segoe UI",9,"bold" if has else "normal"))
 
     def _highlight(self, dt: date):
@@ -365,30 +360,25 @@ class YearCalendarFrame(ttk.Frame):
             self._restore_style(self._selected)
         self._selected=dt
         b=self._btns.get(dt)
-        if b:
-            b.configure(relief="sunken", bg="#dbeafe")
+        if b: b.configure(relief="sunken", bg="#dbeafe")
 
     def _click_day(self, dt: date):
-        # Siempre actualiza selección y lanza callback
         self._highlight(dt)
         if callable(self.on_day_click):
-            try: self.on_day_click(dt)
-            except Exception as ex:
-                messagebox.showerror("Calendario", f"Error al mostrar el día: {ex}")
+            # tercera defensa: ejecutar en la cola de eventos, imposible perderse
+            self.after(0, lambda d=dt: self.on_day_click(d))
 
     def _ctx(self, e, dt: date):
         if callable(self.on_day_context): self.on_day_context(e, dt)
 
     def _dbl_month(self, y,m):
-        if callable(self.on_day_click): self.on_day_click(date(y,m,1), force_month=True)
+        if callable(self.on_day_click): self.after(0, lambda: self.on_day_click(date(y,m,1), force_month=True))
 
     def go_to_date(self, dt: date):
-        self._set(dt.year)
-        self._highlight(dt)
-        if callable(self.on_day_click): self.on_day_click(dt)
+        self._set(dt.year); self._highlight(dt)
+        if callable(self.on_day_click): self.after(0, lambda d=dt: self.on_day_click(d))
 
-    def get_selected_date(self)->date|None:
-        return self._selected
+    def get_selected_date(self)->date|None: return self._selected
 
     def _set(self,year):
         try:year=int(year)
@@ -431,12 +421,10 @@ class PaymentsInfoFrame(ttk.Frame):
         self.tree.configure(yscrollcommand=ysb.set,xscrollcommand=xsb.set)
         ysb.grid(row=2,column=1,sticky="ns"); xsb.grid(row=3,column=0,sticky="ew")
         self.grid_rowconfigure(2,weight=1); self.grid_columnconfigure(0,weight=1)
-
         self.tree.tag_configure("manual", background="#e8fff3")
         self.tree.tag_configure("web", background="#fff7e6")
         self.tree.tag_configure("heuristica", background="#eef5ff")
         self.tree.tag_configure("info", background="#e7f3fe")
-
         ttk.Label(self,text="Nota: FEAGA 16/10–30/11 (anticipos), 01/12–30/06 (saldos).",
                   foreground="#666").grid(row=4,column=0,columnspan=2,sticky="w",pady=(6,0))
 
@@ -471,7 +459,7 @@ class App(tk.Frame):
         self.show_heur=tk.BooleanVar(value=True)
         FeagaRef.seed(self.db, FeagaRef.campaign_year_for(date.today()))
         self._build_ui()
-        self._current_dt=None  # último día mostrado
+        self._current_dt=None
         self._show_day(date.today())
 
     def _setup_styles(self):
@@ -494,11 +482,10 @@ class App(tk.Frame):
         self.pack(fill="both",expand=True)
 
         title=tk.Frame(self,bg="#f0f7ff")
-        tk.Label(title,text="Calendario FEAGA / FEADER – v3.3.1",
+        tk.Label(title,text="Calendario FEAGA / FEADER – v3.4.0",
                  bg="#f0f7ff",fg="#053e7b",font=("Segoe UI",13,"bold")).pack(side="left",padx=10,pady=8)
         title.pack(fill="x")
 
-        # Consola pastel
         self.console = StatusBar(self)
         self.console.show("info", "Usa el calendario o los botones de arriba para consultar pagos.")
 
@@ -508,6 +495,7 @@ class App(tk.Frame):
         ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog).pack(side="left", padx=6, pady=6)
         ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog).pack(side="left", padx=(12,4), pady=6)
         ttk.Button(top,text="Borrar pagos del día…",command=self._delete_selected_day_dialog).pack(side="left", padx=4, pady=6)
+        ttk.Button(top,text="Limpiar panel",command=self._clear_view).pack(side="left", padx=(12,4), pady=6)
 
         ttk.Label(top,text=" | Mostrar: ").pack(side="left", padx=(12,2))
         ttk.Checkbutton(top,text="Manual",variable=self.show_manual,command=self._refresh_current_view).pack(side="left")
@@ -548,6 +536,14 @@ class App(tk.Frame):
 
         tab_idx=ttk.Frame(self.tabs); self.tabs.add(tab_idx,text="Índice")
         self._build_index_tab(tab_idx)
+
+    # ---------- Utilidades UI ----------
+    def _clear_view(self):
+        """Borra el panel y limpia la selección del calendario (para empezar de cero)."""
+        self._current_dt=None
+        self.pay_frame.clear("—")
+        self.yearcal.clear_selection()
+        self.console.show("info","Panel limpio. Selecciona cualquier día del calendario.")
 
     # Índice
     def _build_index_tab(self,parent):
@@ -614,7 +610,7 @@ class App(tk.Frame):
 
     # Mostrar día
     def _show_day(self, dt: date):
-        self._current_dt=dt  # <- guardamos último mostrado (para refrescos posteriores)
+        self._current_dt=dt
         rows=self.db.get_day(dt, self._active_origins())
         for r in rows: r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
         if rows:
@@ -730,19 +726,12 @@ class App(tk.Frame):
     def _help_clear(self):
         messagebox.showinfo(
             "¿Qué hace 'Vaciar manual+web'?",
-            "Elimina SOLO los registros añadidos manualmente por ti o descargados de la web.\n"
-            "Mantiene las fechas de referencia de la 'Referencia FEAGA' (anticipos/saldos) para seguir guiando el calendario."
+            "Elimina SOLO los registros añadidos manualmente o descargados de la web.\n"
+            "Mantiene las fechas de la 'Referencia FEAGA' (anticipos/saldos)."
         )
 
     def _refresh_current_view(self):
-        # Reaplica la vista del último día mostrado o la del mes actualmente visible
-        if self._current_dt:
-            self._show_day(self._current_dt)
-        else:
-            t=self.pay_frame.title_lbl.cget("text")
-            if t.startswith("Mes "):
-                try: y=int(t[-4:]); m=int(t[4:6]); self._show_month(y,m)
-                except Exception: pass
+        if self._current_dt: self._show_day(self._current_dt)
 
     # Web (hilo seguro + messagebox)
     def _update_from_web(self):
@@ -765,7 +754,7 @@ class App(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v3.3.1")
+    root.title("Calendario FEAGA/FEADER – v3.4.0")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
