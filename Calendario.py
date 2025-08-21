@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v4.1.0
+Calendario FEAGA/FEADER – v4.2.0
 
 Novedades en esta versión:
 - Hitos del mes (visual): ventana normal con botones de minimizar/maximizar/cerrar, redimensionable.
@@ -8,6 +8,7 @@ Novedades en esta versión:
   Doble clic en un día => salta al listado principal (como antes).
 - Actualizar pagos (web): muestra ventana emergente con las FUENTES consultadas y resumen final.
 - Resto de funcionalidad se mantiene. Auto-carga de Excel de Aragón incluida (1 vez por año).
+- NUEVO: Centro de Ayuda (¿? y tecla F1) + tooltips en botones.
 
 Dependencias opcionales:
   pip install pandas openpyxl requests beautifulsoup4 lxml
@@ -282,11 +283,11 @@ class FegaWebScraper:
             sal1=date(y,12,1);  sal2=date(y+1,6,30)
             if "Anticipo" in etiqueta:
                 db.add_range(ant1, ant2, tipo=etiqueta, fondo="FEAGA",
-                             detalle="Ventana general de anticipos (nota FEAGA).",
+                             detalle="Ventana general de anticipos (nota FEGA).",
                              fuente=url, origen="web")
             else:
                 db.add_range(sal1, sal2, tipo=etiqueta, fondo="FEAGA",
-                             detalle="Ventana general de saldos (nota FEAGA).",
+                             detalle="Ventana general de saldos (nota FEGA).",
                              fuente=url, origen="web")
 
 # -------------------- Scraper multi-fuente --------------------
@@ -751,6 +752,223 @@ class MonthHitosDialog(tk.Toplevel):
                 w.writerow([r.get("fecha",""), r.get("tipo",""), r.get("fondo",""), r.get("detalle",""), r.get("origen",""), r.get("fuente","")])
         messagebox.showinfo("Exportar", f"Exportado: {os.path.abspath(path)}")
 
+# -------------------- ToolTip (globos de ayuda) --------------------
+class ToolTip:
+    def __init__(self, widget, text, delay=650):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._id = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<Button-1>", self._hide)
+        widget.bind("<Motion>", self._move)
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._id = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._id:
+            try: self.widget.after_cancel(self._id)
+            except Exception: pass
+            self._id = None
+
+    def _show(self):
+        if self._tip or not self.widget.winfo_viewable():
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.attributes("-topmost", True)
+        frm = tk.Frame(self._tip, bg="#333", padx=8, pady=6)
+        frm.pack()
+        lab = tk.Label(frm, text=self.text, bg="#333", fg="#fff",
+                       justify="left", wraplength=360)
+        lab.pack()
+        self._tip.geometry(f"+{x}+{y}")
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip:
+            try: self._tip.destroy()
+            except Exception: pass
+            self._tip = None
+
+    def _move(self, e):
+        if self._tip:
+            self._tip.geometry(f"+{e.x_root+14}+{e.y_root+14}")
+
+# -------------------- Centro de Ayuda --------------------
+class HelpCenterDialog(tk.Toplevel):
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self.app = app
+        self.title("Ayuda · Calendario FEAGA/FEADER")
+        self.geometry("980x620+120+90")
+        self.minsize(820, 520)
+        self.configure(bg="#f7f9fc")
+
+        # Top: búsqueda
+        top = tk.Frame(self, bg="#e7f0ff", highlightbackground="#cddcfb", highlightthickness=1)
+        tk.Label(top, text="Centro de ayuda", bg="#e7f0ff", fg="#093a76",
+                 font=("Segoe UI",11,"bold")).pack(side="left", padx=10, pady=6)
+        tk.Label(top, text="Buscar:", bg="#e7f0ff").pack(side="left", padx=(12,0))
+        self.q = tk.Entry(top, width=32)
+        self.q.pack(side="left", padx=6)
+        self.q.bind("<KeyRelease>", self._filter)
+        tk.Button(top, text="Cerrar", command=self.destroy).pack(side="right", padx=8)
+        top.grid(row=0, column=0, sticky="ew")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Paned: índice / contenido
+        pan = ttk.Panedwindow(self, orient="horizontal")
+        pan.grid(row=1, column=0, sticky="nsew")
+
+        left = tk.Frame(pan, bg="#f7f9fc")
+        right = tk.Frame(pan, bg="#ffffff")
+        pan.add(left, weight=1)
+        pan.add(right, weight=3)
+
+        # Índice
+        self.list = tk.Listbox(left, activestyle="dotbox")
+        self.list.pack(fill="both", expand=True, padx=8, pady=8)
+        self.list.bind("<<ListboxSelect>>", self._on_select)
+        self.list.bind("<Return>", self._on_open)
+
+        # Contenido
+        self.text = tk.Text(right, wrap="word", bg="#ffffff")
+        self.text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.text.configure(state="disabled")
+        ysb = ttk.Scrollbar(right, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=ysb.set)
+        ysb.place(in_=self.text, relx=1.0, rely=0, relheight=1.0, x=-16)
+
+        # Datos
+        self._topics = self._build_topics()
+        self._all_keys = list(self._topics.keys())
+        for k in self._all_keys:
+            self.list.insert("end", k)
+
+        # Accesos rápidos
+        self.bind("<Control-f>", lambda _e: (self.q.focus_set(), self.q.select_range(0, "end")))
+
+        # Selección inicial
+        self._open("Barra superior (botones principales)")
+
+    def _build_topics(self) -> dict[str,str]:
+        v = "v4.1.0"
+        return {
+            "Barra superior (botones principales)":
+            f"""• Pagos de hoy → muestra el día actual en el panel de pagos.
+• Hitos del mes (visual) → nueva ventana redimensionable con calendario a la izquierda y panel de detalle a la derecha. Clic en día = previsualiza. Doble clic = abre el listado principal.
+• Listado del mes → muestra todas las filas del mes seleccionado (según filtros).
+• Buscar rango… → ventana para consultar entre dos fechas (dd/mm/aaaa).
+• Añadir pago… → alta manual. Campos obligatorios: Fecha, Tipo, Detalle. Fondo: FEAGA/FEADER/—.
+• Borrar pagos del día… → dos opciones:
+    – Borrar manual+web: conserva la Referencia FEAGA (heurística).
+    – Borrar TODO: elimina también la Referencia FEAGA.
+• Limpiar panel → limpia la tabla y deselecciona el calendario. El botón parpadea tras mostrar resultados para guiar al usuario.
+• Mostrar: Manual / Web / Referencia FEAGA → filtros visibles. Si desmarcas todos, el sistema cae a los tres por defecto.
+• Regenerar referencia FEAGA → resembrado de ventanas Anticipo (16/10–30/11) y Saldo (01/12–30/06) de la campaña actual (no duplica por índice único).
+• Vaciar manual+web → elimina orígenes MANUAL y WEB, preserva Referencia FEAGA. Después resembramos por si acaso; los duplicados se ignoran.
+• Vaciar TODO → elimina todo; usa luego “Regenerar referencia FEAGA” si quieres recuperar las ventanas.
+• ¿? (Ayuda, {v}) → abre este Centro de Ayuda. Atajo: F1.
+""",
+
+            "Calendario anual (interacción)":
+            """• Clic en un día → muestra ese día.
+• Doble clic en un día → muestra el mes completo.
+• Clic derecho → menú contextual (añadir, borrar, ver mes).
+• Días con eventos se dibujan con fondo suave; fines de semana en granate.
+• Marcadores: si no hay datos del día, se muestran referencias FEAGA/FEADER del día o, en su defecto, del mes.
+""",
+
+            "Panel de Pagos (tabla inferior)":
+            """• Colores por origen:
+    – Verde pálido: Manual
+    – Amarillo pálido: Web
+    – Azul muy suave: Referencia FEAGA (heurística)
+    – Celeste: Información (mensajes informativos)
+• La columna “Fuente” incluye URL o nota de origen cuando existe.
+• Algunas filas “Del mes · … (original: dd/mm/aaaa)” indican que el sistema trajo información mensual para contextualizar un día sin datos propios.
+""",
+
+            "Hitos del mes (visual)":
+            """• Ventana normal (minimizar/maximizar/cerrar) y redimensionable.
+• Izquierda: rejilla mensual con chips (hasta 3 tipos principales) y contadores FEAGA/FEADER por día.
+• Derecha: panel de detalle completo del día (sin recortes).
+• Clic = previsualiza a la derecha; doble clic = abre el listado principal en la pestaña Calendario.
+• Botón “Exportar mes (CSV)” para extraer todas las filas del mes.
+• Leyenda inferior de colores.
+""",
+
+            "Actualizar pagos (web)":
+            """• Abre una ventana de “Fuentes consultadas”.
+• Descarga desde:
+    – Notas FEGA (PDF) para anticipo/saldo.
+    – Noticias FEGA (titulares que contengan 'anticipo', 'saldo', 'pago', etc.).
+    – Fuentes extra que declares en MultiSourceScraper.EXTRA_SOURCES.
+• Requiere 'requests' (opcional). Los nuevos registros se insertan con origen WEB, evitando duplicados.
+• Al finalizar, muestra cuántas filas se añadieron.
+""",
+
+            "Importar Excel / CSV":
+            """• Importador genérico (Fecha/Tipo/Fondo/Detalle/Fuente).
+• Importador especializado “Aragón” (Mes/Actividad/FEAGA/FEADER): interpreta expresiones tipo
+  “del 3 al 15 de mayo”, “a partir del 10”, “12 de junio”, etc., insertando rangos o días.
+• Dependencias opcionales: pandas + openpyxl.
+• Autocarga silenciosa (si encuentra el Excel de Aragón en rutas predefinidas) una vez por año.
+""",
+
+            "Pestaña Índice":
+            """• Permite listar por rango de fechas y saltar a un día concreto con “Ir a día”.
+• Respeta los colores por origen. Botón “Refrescar” para actualizar tras cambios.
+""",
+
+            "Menú contextual (clic derecho en día)":
+            """• Añadir pago…
+• Borrar manual+web del día
+• Borrar TODO del día
+• Ver mes
+""",
+
+            "Atajos de teclado":
+            """• F1 → abrir Centro de Ayuda
+• Ctrl+F dentro del Centro de Ayuda → foco al buscador
+"""
+        }
+
+    def _filter(self, _e=None):
+        q = (self.q.get() or "").strip().lower()
+        self.list.delete(0, "end")
+        for k in self._all_keys:
+            if not q or q in k.lower() or q in self._topics[k].lower():
+                self.list.insert("end", k)
+        if self.list.size() and not self.list.curselection():
+            self.list.selection_set(0)
+
+    def _on_select(self, _e=None):
+        sel = self.list.curselection()
+        if sel:
+            self._open(self.list.get(sel[0]))
+
+    def _on_open(self, _e=None):
+        self._on_select()
+
+    def _open(self, key: str):
+        txt = self._topics.get(key, "")
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", f"{key}\n", ("h1",))
+        self.text.insert("end", "\n")
+        self.text.insert("end", txt)
+        self.text.tag_configure("h1", font=("Segoe UI", 12, "bold"), foreground="#093a76")
+        self.text.configure(state="disabled")
+
 # -------------------- Panel de pagos --------------------
 class PaymentsInfoFrame(ttk.Frame):
     ORIGIN_LABEL = {"manual":"Manual","web":"Web","heuristica":"Referencia FEAGA","info":"Información"}
@@ -857,12 +1075,25 @@ class App(tk.Frame):
         self.console.show("info", "Usa el calendario o los botones de arriba para consultar pagos.")
 
         top=tk.Frame(self,bg="#eef5ff",highlightbackground="#cddcfb",highlightthickness=1)
-        self._color_btn(top,"Pagos de hoy","#2e7d32", lambda: self._show_day(date.today())).pack(side="left", padx=(8,4), pady=6)
-        self._color_btn(top,"Hitos del mes (visual)","#0d6efd", self._show_month_visual_of_selected).pack(side="left", padx=4, pady=6)
-        ttk.Button(top,text="Listado del mes",command=self._show_month_of_selected).pack(side="left", padx=6, pady=6)
-        ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog).pack(side="left", padx=6, pady=6)
-        ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog).pack(side="left", padx=(12,4), pady=6)
-        ttk.Button(top,text="Borrar pagos del día…",command=self._delete_selected_day_dialog).pack(side="left", padx=4, pady=6)
+
+        # Botones principales (guardamos referencia para tooltips)
+        self.btn_hoy = self._color_btn(top,"Pagos de hoy","#2e7d32", lambda: self._show_day(date.today()))
+        self.btn_hoy.pack(side="left", padx=(8,4), pady=6)
+
+        self.btn_hitos = self._color_btn(top,"Hitos del mes (visual)","#0d6efd", self._show_month_visual_of_selected)
+        self.btn_hitos.pack(side="left", padx=4, pady=6)
+
+        self.btn_listado = ttk.Button(top,text="Listado del mes",command=self._show_month_of_selected)
+        self.btn_listado.pack(side="left", padx=6, pady=6)
+
+        self.btn_rango = ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog)
+        self.btn_rango.pack(side="left", padx=6, pady=6)
+
+        self.btn_add = ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog)
+        self.btn_add.pack(side="left", padx=(12,4), pady=6)
+
+        self.btn_borrar = ttk.Button(top,text="Borrar pagos del día…",command=self._delete_selected_day_dialog)
+        self.btn_borrar.pack(side="left", padx=4, pady=6)
 
         self.clear_btn = tk.Button(top,text="Limpiar panel",bg="#9c27b0",fg="white",
                                    activebackground="#9c27b0",relief="raised",bd=1,highlightthickness=0,
@@ -872,15 +1103,40 @@ class App(tk.Frame):
         self._clear_btn_bg = self.clear_btn.cget("bg")
 
         ttk.Label(top,text=" | Mostrar: ").pack(side="left", padx=(12,2))
-        ttk.Checkbutton(top,text="Manual",variable=self.show_manual,command=self._refresh_current_view).pack(side="left")
-        ttk.Checkbutton(top,text="Web",variable=self.show_web,command=self._refresh_current_view).pack(side="left")
-        ttk.Checkbutton(top,text="Referencia FEAGA",variable=self.show_heur,command=self._refresh_current_view).pack(side="left")
+        self.chk_manual = ttk.Checkbutton(top,text="Manual",variable=self.show_manual,command=self._refresh_current_view)
+        self.chk_manual.pack(side="left")
+        self.chk_web = ttk.Checkbutton(top,text="Web",variable=self.show_web,command=self._refresh_current_view)
+        self.chk_web.pack(side="left")
+        self.chk_heur = ttk.Checkbutton(top,text="Referencia FEAGA",variable=self.show_heur,command=self._refresh_current_view)
+        self.chk_heur.pack(side="left")
 
-        ttk.Button(top,text="Regenerar referencia FEAGA",command=self._regen_heuristics).pack(side="right", padx=6, pady=6)
-        ttk.Button(top,text="Vaciar TODO",command=lambda:self._clear_db(include_heur=True)).pack(side="right", padx=(0,8), pady=6)
-        ttk.Button(top,text="Vaciar manual+web",command=lambda:self._clear_db(include_heur=False)).pack(side="right", padx=6, pady=6)
-        tk.Button(top,text="¿?", width=3, command=self._help_clear).pack(side="right", padx=(0,6), pady=6)
+        # Botones de la derecha
+        self.btn_regen = ttk.Button(top,text="Regenerar referencia FEAGA",command=self._regen_heuristics)
+        self.btn_regen.pack(side="right", padx=6, pady=6)
+        self.btn_vaciar_todo = ttk.Button(top,text="Vaciar TODO",command=lambda:self._clear_db(include_heur=True))
+        self.btn_vaciar_todo.pack(side="right", padx=(0,8), pady=6)
+        self.btn_vaciar_mw = ttk.Button(top,text="Vaciar manual+web",command=lambda:self._clear_db(include_heur=False))
+        self.btn_vaciar_mw.pack(side="right", padx=6, pady=6)
+        self.btn_help = tk.Button(top,text="¿?", width=3, command=self._open_help)
+        self.btn_help.pack(side="right", padx=(0,6), pady=6)
+
         top.pack(fill="x")
+
+        # Tooltips
+        ToolTip(self.btn_hoy, "Ir al día de hoy.")
+        ToolTip(self.btn_hitos, "Vista mensual visual con panel de detalle y exportación CSV.")
+        ToolTip(self.btn_listado, "Listar todas las filas del mes seleccionado.")
+        ToolTip(self.btn_rango, "Buscar por rango de fechas (dd/mm/aaaa).")
+        ToolTip(self.btn_add, "Añadir un pago manual.")
+        ToolTip(self.btn_borrar, "Borrar pagos del día seleccionado (manual+web o todo).")
+        ToolTip(self.clear_btn, "Limpiar la tabla y la selección del calendario.")
+        ToolTip(self.chk_manual, "Mostrar/ocultar filas añadidas manualmente.")
+        ToolTip(self.chk_web, "Mostrar/ocultar filas descargadas de la web.")
+        ToolTip(self.chk_heur, "Mostrar/ocultar la referencia FEAGA (ventanas anticipo/saldo).")
+        ToolTip(self.btn_vaciar_mw, "Borra MANUAL+WEB. Mantiene Referencia FEAGA.")
+        ToolTip(self.btn_vaciar_todo, "Borra TODO (incluida la Referencia FEAGA).")
+        ToolTip(self.btn_regen, "Resembrar la Referencia FEAGA de la campaña actual.")
+        ToolTip(self.btn_help, "Abrir Centro de Ayuda (F1).")
 
         self.tabs=ttk.Notebook(self); self.tabs.pack(fill="both",expand=True,padx=10,pady=10)
 
@@ -892,9 +1148,13 @@ class App(tk.Frame):
         v_split.add(cal_holder,weight=3); v_split.add(self.pay_frame,weight=2)
 
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(0,4))
-        self._color_btn(tools,"Actualizar pagos (web)","#ff8f00", self._update_from_web).pack(side="left", padx=2, pady=2)
-        ttk.Button(tools,text="Importar Excel…",command=self._import_excel).pack(side="left", padx=8, pady=2)
+        self.btn_actualizar = self._color_btn(tools,"Actualizar pagos (web)","#ff8f00", self._update_from_web)
+        self.btn_actualizar.pack(side="left", padx=2, pady=2)
+        self.btn_importar = ttk.Button(tools,text="Importar Excel…",command=self._import_excel)
+        self.btn_importar.pack(side="left", padx=8, pady=2)
         ttk.Label(tools,text="(orígenes: Web/Manual; FEAGA=genérico, FEADER=según resoluciones)",foreground="#666").pack(side="left", padx=8)
+        ToolTip(self.btn_actualizar, "Consultar FEGA y otras fuentes (requiere 'requests').")
+        ToolTip(self.btn_importar, "Importar Excel/CSV (genérico o plantilla Aragón).")
 
         def has_ev(y,m,d):
             dt=date(y,m,d)
@@ -950,8 +1210,12 @@ class App(tk.Frame):
         self.idx_from=ttk.Entry(top,width=12); self.idx_from.pack(side="left",padx=(0,10))
         ttk.Label(top,text="Hasta:").pack(side="left")
         self.idx_to=ttk.Entry(top,width=12); self.idx_to.pack(side="left",padx=(4,10))
-        ttk.Button(top,text="Refrescar",command=self._refresh_index_tab).pack(side="left")
-        ttk.Button(top,text="Ir a día",command=self._goto_from_index_tab).pack(side="left",padx=(10,0))
+        self.idx_btn_refresh = ttk.Button(top,text="Refrescar",command=self._refresh_index_tab)
+        self.idx_btn_refresh.pack(side="left")
+        self.idx_btn_goto = ttk.Button(top,text="Ir a día",command=self._goto_from_index_tab)
+        self.idx_btn_goto.pack(side="left",padx=(10,0))
+        ToolTip(self.idx_btn_refresh, "Volver a cargar el listado con el rango indicado.")
+        ToolTip(self.idx_btn_goto, "Abrir la vista del día seleccionado en la pestaña Calendario.")
 
         cols=("fecha","tipo","fondo","detalle","origen","fuente")
         self.idx_tree=ttk.Treeview(parent,columns=cols,show="headings",selectmode="browse",style="Colored.Treeview")
@@ -1160,12 +1424,17 @@ class App(tk.Frame):
         self.yearcal.refresh(); self._refresh_current_view()
         self.console.show("ok","Referencia FEAGA regenerada para la campaña actual.")
 
+    # Conservamos el diálogo antiguo por si quieres usarlo en algún sitio
     def _help_clear(self):
         messagebox.showinfo(
             "¿Qué hace 'Vaciar manual+web'?",
             "Elimina SOLO los registros añadidos manualmente o descargados de la web.\n"
             "Mantiene las fechas de la 'Referencia FEAGA' (anticipos/saldos)."
         )
+
+    # Nuevo Centro de Ayuda
+    def _open_help(self):
+        HelpCenterDialog(self)
 
     def _refresh_current_view(self):
         if self._current_dt: self._show_day(self._current_dt)
@@ -1484,6 +1753,8 @@ def main():
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
     except Exception: pass
     app=App(root); app.pack(fill="both",expand=True)
+    # Atajo universal de ayuda
+    root.bind_all("<F1>", lambda e: app._open_help())
     root.mainloop()
 
 if __name__=="__main__":
