@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v3.4.0
-- Calendario: tk.Button + <ButtonRelease-1> + after(0, ...) -> cada clic refresca sí o sí.
-- Botón "Limpiar panel" que además resetea la selección del calendario (por si quieres empezar de cero).
-- Terminología FEAGA en toda la UI.
-- Persistencia SQLite (thread-safe).
+Calendario FEAGA/FEADER – v3.5.0
+
+Novedades:
+- Parpadeo del botón “Limpiar panel” en cada clic de calendario (avisa al usuario).
+- Descarga web con etiquetas más expresivas (anticipos ecorregímenes / asociadas, saldo EERR).
+- Importación de EXCEL/CSV: lee Fecha/Tipo/Fondo/Detalle/Fuente (nombres flexibles), inserta en SQLite.
+- Persistencia SQLite hilo-segura. UI con colores pastel y mensajes claros FEAGA/FEADER.
 """
 
 import calendar
@@ -13,7 +15,7 @@ import sqlite3
 import threading
 from datetime import date, datetime, timedelta
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 DB_FILE = "pagos_pepac.sqlite3"
 
@@ -23,8 +25,15 @@ def fmt_dmy(d: date) -> str: return d.strftime("%d/%m/%Y")
 def parse_ddmmyyyy(s: str) -> date | None:
     s = s.strip()
     if not s: return None
-    try: return datetime.strptime(s, "%d/%m/%Y").date()
-    except Exception: return None
+    for fmt in ("%d/%m/%Y","%d/%m/%y","%Y-%m-%d"):
+        try: return datetime.strptime(s, fmt).date()
+        except Exception: pass
+    # dd-mm-aaaa
+    try:
+        s2 = s.replace("-", "/")
+        return datetime.strptime(s2, "%d/%m/%Y").date()
+    except Exception:
+        return None
 
 def daterange(d1: date, d2: date):
     cur = d1
@@ -175,12 +184,17 @@ class FeagaRef:
                      "fuente":"Referencia", "origen":"info"})
         return rows
 
-# -------------------- Scraper web (opcional) --------------------
+# -------------------- Scraper web (opcional, etiquetas más claras) --------------------
 class FegaWebScraper:
+    """
+    Muy simple: lee 3 notas públicas y graba ventanas completas.
+    Objetivo: tener “fuente web” diferenciada (anticipos ecorregímenes/AAS, saldo EERR),
+    no sustituir resoluciones autonómicas.
+    """
     NOTE_URLS = [
-        "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf",
-        "https://www.fega.gob.es/sites/default/files/files/document/Nota_Web_AAS_Ca_2024_ANTICIPO.pdf",
-        "https://www.fga.gob.es/sites/default/files/files/document/241115_NOTA_WEB_EERR_PRIMER_SALDO_Ca_2024_def.pdf".replace("fga","fega")
+        ("Anticipo ecorregímenes", "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf"),
+        ("Anticipo ayudas asociadas", "https://www.fega.gob.es/sites/default/files/files/document/Nota_Web_AAS_Ca_2024_ANTICIPO.pdf"),
+        ("Saldo ecorregímenes (EERR)", "https://www.fega.gob.es/sites/default/files/files/document/241115_NOTA_WEB_EERR_PRIMER_SALDO_Ca_2024_def.pdf"),
     ]
     def __init__(self):
         try:
@@ -194,7 +208,7 @@ class FegaWebScraper:
     def fetch_into_db(self, db: PaymentsDB, year_hint:int|None=None):
         if not self._ok: raise RuntimeError("Falta 'requests' (pip install requests).")
         import requests
-        for url in self.NOTE_URLS:
+        for etiqueta, url in self.NOTE_URLS:
             try:
                 r=requests.get(url,timeout=15)
                 content=r.content.decode("latin-1",errors="ignore") if r.status_code==200 else url
@@ -202,12 +216,17 @@ class FegaWebScraper:
                 content=url
             m=re.search(r"(20\d{2})", content)
             y=int(m.group(1)) if m else (year_hint or date.today().year)
+            # Ventanas estándar
             ant1=date(y,10,16); ant2=date(y,11,30)
             sal1=date(y,12,1);  sal2=date(y+1,6,30)
-            db.add_range(ant1, ant2, tipo="Anticipo ayudas directas", fondo="FEAGA",
-                         detalle="Ventana general de anticipos (nota FEAGA).", fuente=url, origen="web")
-            db.add_range(sal1, sal2, tipo="Saldo ayudas directas", fondo="FEAGA",
-                         detalle="Ventana general de saldos (nota FEAGA).", fuente=url, origen="web")
+            if "Anticipo" in etiqueta:
+                db.add_range(ant1, ant2, tipo=etiqueta, fondo="FEAGA",
+                             detalle="Ventana general de anticipos (nota FEAGA).",
+                             fuente=url, origen="web")
+            else:
+                db.add_range(sal1, sal2, tipo=etiqueta, fondo="FEAGA",
+                             detalle="Ventana general de saldos (nota FEAGA).",
+                             fuente=url, origen="web")
 
 # -------------------- StatusBar pastel --------------------
 class StatusBar(tk.Frame):
@@ -253,7 +272,7 @@ class VerticalScrolledFrame(ttk.Frame):
             else: self.canvas.yview_scroll(int(-ev.delta/40),"units")
         except Exception: pass
 
-# -------------------- Calendario con botones (triple seguridad) --------------------
+# -------------------- Calendario con botones --------------------
 class YearCalendarFrame(ttk.Frame):
     MESES_ES=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
     DIAS=["L","M","X","J","V","S","D"]
@@ -293,7 +312,6 @@ class YearCalendarFrame(ttk.Frame):
     def refresh(self): self._grid_year()
 
     def clear_selection(self):
-        """Limpia selección visual y lógica (para el botón 'Limpiar panel')."""
         if self._selected and self._selected in self._btns:
             self._restore_style(self._selected)
         self._selected=None
@@ -337,7 +355,6 @@ class YearCalendarFrame(ttk.Frame):
                             font=(font_bold if has else font_norm))
                 b.grid(row=r,column=c,padx=1,pady=1,sticky="nsew")
                 dt=date(year,month,dd)
-                # 1) command, 2) ButtonRelease-1, 3) forzamos via after(0,...)
                 b.configure(command=lambda dti=dt: self._click_day(dti))
                 b.bind("<ButtonRelease-1>", lambda e,dti=dt: self._click_day(dti))
                 b.bind("<Double-Button-1>", lambda e,y=year,m=month: self._dbl_month(y,m))
@@ -365,7 +382,6 @@ class YearCalendarFrame(ttk.Frame):
     def _click_day(self, dt: date):
         self._highlight(dt)
         if callable(self.on_day_click):
-            # tercera defensa: ejecutar en la cola de eventos, imposible perderse
             self.after(0, lambda d=dt: self.on_day_click(d))
 
     def _ctx(self, e, dt: date):
@@ -411,8 +427,8 @@ class PaymentsInfoFrame(ttk.Frame):
 
         cols=("fecha","tipo","fondo","detalle","origen","fuente")
         self.tree=ttk.Treeview(self,columns=cols,show="headings",selectmode="none",style="Colored.Treeview")
-        headers={"fecha":(92,"w"),"tipo":(200,"w"),"fondo":(80,"w"),
-                 "detalle":(560,"w"),"origen":(130,"center"),"fuente":(220,"w")}
+        headers={"fecha":(92,"w"),"tipo":(220,"w"),"fondo":(80,"w"),
+                 "detalle":(560,"w"),"origen":(140,"center"),"fuente":(220,"w")}
         for c,(w,anc) in headers.items():
             self.tree.heading(c,text=c.capitalize()); self.tree.column(c,width=w,anchor=anc,stretch=True)
         self.tree.grid(row=2,column=0,sticky="nsew")
@@ -421,10 +437,12 @@ class PaymentsInfoFrame(ttk.Frame):
         self.tree.configure(yscrollcommand=ysb.set,xscrollcommand=xsb.set)
         ysb.grid(row=2,column=1,sticky="ns"); xsb.grid(row=3,column=0,sticky="ew")
         self.grid_rowconfigure(2,weight=1); self.grid_columnconfigure(0,weight=1)
+
         self.tree.tag_configure("manual", background="#e8fff3")
         self.tree.tag_configure("web", background="#fff7e6")
         self.tree.tag_configure("heuristica", background="#eef5ff")
         self.tree.tag_configure("info", background="#e7f3fe")
+
         ttk.Label(self,text="Nota: FEAGA 16/10–30/11 (anticipos), 01/12–30/06 (saldos).",
                   foreground="#666").grid(row=4,column=0,columnspan=2,sticky="w",pady=(6,0))
 
@@ -460,6 +478,7 @@ class App(tk.Frame):
         FeagaRef.seed(self.db, FeagaRef.campaign_year_for(date.today()))
         self._build_ui()
         self._current_dt=None
+        self._blink_job=None; self._blink_cycles=0
         self._show_day(date.today())
 
     def _setup_styles(self):
@@ -482,7 +501,7 @@ class App(tk.Frame):
         self.pack(fill="both",expand=True)
 
         title=tk.Frame(self,bg="#f0f7ff")
-        tk.Label(title,text="Calendario FEAGA / FEADER – v3.4.0",
+        tk.Label(title,text="Calendario FEAGA / FEADER – v3.5.0",
                  bg="#f0f7ff",fg="#053e7b",font=("Segoe UI",13,"bold")).pack(side="left",padx=10,pady=8)
         title.pack(fill="x")
 
@@ -495,7 +514,14 @@ class App(tk.Frame):
         ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog).pack(side="left", padx=6, pady=6)
         ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog).pack(side="left", padx=(12,4), pady=6)
         ttk.Button(top,text="Borrar pagos del día…",command=self._delete_selected_day_dialog).pack(side="left", padx=4, pady=6)
-        ttk.Button(top,text="Limpiar panel",command=self._clear_view).pack(side="left", padx=(12,4), pady=6)
+
+        # Limpiar panel (tk.Button para poder parpadear)
+        self.clear_btn = tk.Button(top,text="Limpiar panel",bg="#9c27b0",fg="white",
+                                   activebackground="#9c27b0",relief="raised",bd=1,highlightthickness=0,
+                                   command=self._clear_view)
+        self.clear_btn.configure(font=("Segoe UI",9,"bold"), padx=10, pady=4, cursor="hand2")
+        self.clear_btn.pack(side="left", padx=(12,4), pady=6)
+        self._clear_btn_bg = self.clear_btn.cget("bg")
 
         ttk.Label(top,text=" | Mostrar: ").pack(side="left", padx=(12,2))
         ttk.Checkbutton(top,text="Manual",variable=self.show_manual,command=self._refresh_current_view).pack(side="left")
@@ -519,7 +545,8 @@ class App(tk.Frame):
 
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(0,4))
         self._color_btn(tools,"Actualizar pagos (web)","#ff8f00", self._update_from_web).pack(side="left", padx=2, pady=2)
-        ttk.Label(tools,text="(opcional; los registros quedan como origen 'web')",foreground="#666").pack(side="left", padx=8)
+        ttk.Button(tools,text="Importar Excel…",command=self._import_excel).pack(side="left", padx=8, pady=2)
+        ttk.Label(tools,text="(orígenes: Web/Manual; FEAGA=genérico, FEADER=según resoluciones)",foreground="#666").pack(side="left", padx=8)
 
         def has_ev(y,m,d):
             dt=date(y,m,d)
@@ -537,9 +564,34 @@ class App(tk.Frame):
         tab_idx=ttk.Frame(self.tabs); self.tabs.add(tab_idx,text="Índice")
         self._build_index_tab(tab_idx)
 
+    # ---------- Parpadeo del botón Limpiar panel ----------
+    def _blink_clear_button(self, cycles:int=6, interval:int=180):
+        # Reinicia si ya estaba parpadeando
+        if self._blink_job:
+            try: self.after_cancel(self._blink_job)
+            except Exception: pass
+            self._blink_job=None
+        self._blink_cycles = cycles*2
+        def _step():
+            if self._blink_cycles<=0:
+                self.clear_btn.configure(bg=self._clear_btn_bg, activebackground=self._clear_btn_bg)
+                self._blink_job=None
+                return
+            cur=self.clear_btn.cget("bg")
+            nxt = "#ffc107" if cur==self._clear_btn_bg else self._clear_btn_bg
+            self.clear_btn.configure(bg=nxt, activebackground=nxt)
+            self._blink_cycles -= 1
+            self._blink_job = self.after(interval, _step)
+        _step()
+
     # ---------- Utilidades UI ----------
     def _clear_view(self):
-        """Borra el panel y limpia la selección del calendario (para empezar de cero)."""
+        # Detener parpadeo si lo hubiera
+        if self._blink_job:
+            try: self.after_cancel(self._blink_job)
+            except Exception: pass
+            self._blink_job=None
+        self.clear_btn.configure(bg=self._clear_btn_bg, activebackground=self._clear_btn_bg)
         self._current_dt=None
         self.pay_frame.clear("—")
         self.yearcal.clear_selection()
@@ -608,7 +660,7 @@ class App(tk.Frame):
         if self.show_heur.get(): s.add("heuristica")
         return s or {"manual","web","heuristica"}
 
-    # Mostrar día
+    # Mostrar día (dispara parpadeo)
     def _show_day(self, dt: date):
         self._current_dt=dt
         rows=self.db.get_day(dt, self._active_origins())
@@ -621,6 +673,8 @@ class App(tk.Frame):
             for r in gen: r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
             self.pay_frame.show_rows(f"Día {fmt_dmy(dt)} (referencia)", gen)
             self.console.show("info", f"No hay pagos guardados para {fmt_dmy(dt)}. Mostrando referencias FEAGA/FEADER.")
+        # ¡Parpadeo!
+        self._blink_clear_button()
 
     def _show_month(self, y:int, m:int):
         rows=self.db.get_month(y,m, self._active_origins())
@@ -628,10 +682,11 @@ class App(tk.Frame):
         if not rows:
             self.pay_frame.clear("—")
             self.console.show("warn", f"No hay pagos en {m:02d}/{y} con los filtros actuales.")
-            return
-        self.pay_frame.show_rows(f"Mes {m:02d}/{y}", rows)
-        self.console.show("ok", f"Mostrando {len(rows)} elemento(s) del mes {m:02d}/{y}.")
+        else:
+            self.pay_frame.show_rows(f"Mes {m:02d}/{y}", rows)
+            self.console.show("ok", f"Mostrando {len(rows)} elemento(s) del mes {m:02d}/{y}.")
         self.tabs.select(0)
+        self._blink_clear_button()
 
     def _show_month_of_selected(self):
         dt=self.yearcal.get_selected_date() or date.today()
@@ -733,6 +788,80 @@ class App(tk.Frame):
     def _refresh_current_view(self):
         if self._current_dt: self._show_day(self._current_dt)
 
+    # -------------------- Importar Excel/CSV --------------------
+    @staticmethod
+    def _norm(s:str)->str: return re.sub(r"[^a-z]", "", str(s).lower())
+
+    def _find_col(self, columns, candidates)->str|None:
+        cn=[self._norm(x) for x in candidates]
+        for c in columns:
+            if self._norm(c) in cn: return c
+        for c in columns:
+            nc=self._norm(c)
+            if any(x in nc for x in cn): return c
+        return None
+
+    def _import_excel(self):
+        path=filedialog.askopenfilename(
+            title="Selecciona Excel/CSV de pagos",
+            filetypes=[("Excel","*.xlsx;*.xls"),("CSV","*.csv"),("Todos","*.*")]
+        )
+        if not path: return
+        try:
+            import pandas as pd
+        except Exception:
+            messagebox.showerror("Excel","Necesitas instalar dependencias:\n\npip install pandas openpyxl")
+            return
+        try:
+            if path.lower().endswith(".csv"):
+                df=pd.read_csv(path, sep=None, engine="python")
+            else:
+                df=pd.read_excel(path)  # requiere openpyxl
+        except Exception as ex:
+            messagebox.showerror("Excel", f"No se pudo leer el archivo:\n{ex}")
+            return
+
+        if df.empty:
+            messagebox.showinfo("Excel","El fichero no tiene filas."); return
+
+        c_fecha  = self._find_col(df.columns, ["fecha","día","dia","date"])
+        c_tipo   = self._find_col(df.columns, ["tipo","concepto","pago","descripcion","descripción"])
+        c_fondo  = self._find_col(df.columns, ["fondo","feaga","feader","linea","línea"])
+        c_det    = self._find_col(df.columns, ["detalle","descripcion","descripción","observaciones","nota","obs"])
+        c_fuente = self._find_col(df.columns, ["fuente","source","url","enlace"])
+        if not (c_fecha and c_tipo and c_det):
+            cols="\n".join(map(str,df.columns))
+            messagebox.showerror("Excel",
+                "No encuentro columnas mínimas (Fecha, Tipo y Detalle).\n"
+                f"Columnas detectadas:\n{cols}")
+            return
+
+        inserted=0; skipped=0; errs=[]
+        for i,row in df.iterrows():
+            try:
+                raw=row[c_fecha]
+                if isinstance(raw,(datetime,date)): d = raw.date() if isinstance(raw,datetime) else raw
+                else:
+                    d = parse_ddmmyyyy(str(raw)) or (datetime.fromisoformat(str(raw)).date() if str(raw) else None)
+                if not d: skipped+=1; errs.append(f"Fila {i+2}: fecha inválida '{raw}'"); continue
+                tipo = str(row[c_tipo]).strip()
+                detalle = str(row[c_det]).strip()
+                if not tipo or not detalle: skipped+=1; errs.append(f"Fila {i+2}: falta Tipo/Detalle"); continue
+                fondo = (str(row[c_fondo]).strip().upper() if c_fondo else "—")
+                if "FEADER" in fondo: fondo="FEADER"
+                elif "FEAGA" in fondo or "FEGA" in fondo: fondo="FEAGA"
+                elif fondo in ("", "NAN"): fondo="—"
+                fuente = str(row[c_fuente]).strip() if c_fuente else ""
+                self.db.add(d, tipo, fondo, detalle, fuente, origen="manual")
+                inserted+=1
+            except Exception as ex:
+                skipped+=1; errs.append(f"Fila {i+2}: {ex}")
+
+        self.yearcal.refresh(); self._refresh_current_view()
+        msg=f"Importación completada.\nInsertados: {inserted}\nOmitidos: {skipped}"
+        if errs: msg += f"\n\nPrimeros errores:\n" + "\n".join(errs[:10])
+        messagebox.showinfo("Excel", msg)
+
     # Web (hilo seguro + messagebox)
     def _update_from_web(self):
         def run():
@@ -754,7 +883,7 @@ class App(tk.Frame):
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v3.4.0")
+    root.title("Calendario FEAGA/FEADER – v3.5.0")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
