@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v3.5.0
+Calendario FEAGA/FEADER – v3.8.0
 
 Novedades:
-- Parpadeo del botón “Limpiar panel” en cada clic de calendario (avisa al usuario).
-- Descarga web con etiquetas más expresivas (anticipos ecorregímenes / asociadas, saldo EERR).
-- Importación de EXCEL/CSV: lee Fecha/Tipo/Fondo/Detalle/Fuente (nombres flexibles), inserta en SQLite.
-- Persistencia SQLite hilo-segura. UI con colores pastel y mensajes claros FEAGA/FEADER.
+- Día → FEAGA/FEADER: si no hay específicos del día, añade los del mes (etiquetado claro).
+- “Hitos del mes (visual)” → cuadrícula con totales FEAGA/FEADER, chips por día, tooltip y clic a día, exportar CSV.
+- Importador específico para Excel Aragón (hoja 'Calendario' con Mes/Actividad/Ayuda FEAGA/Ayuda FEADER):
+  • Pide año destino y mapea frases tipo "1 de febrero", "Del 1 al 9 de junio", "A partir del 16 de octubre".
+  • Crea eventos FEAGA/FEADER según 'Sí', con Tipo/Detalle limpios, origen=manual, fuente="Excel Aragón (Calendario)".
+- Scraping multi-fuente: FEGA (PDF + noticias HTML). Arquitectura para añadir CCAA fácilmente.
+
+Dependencias opcionales para importar/scrapear:
+  pip install pandas openpyxl requests beautifulsoup4 lxml
 """
 
 import calendar
@@ -16,6 +21,9 @@ import threading
 from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from collections import defaultdict, Counter
+from contextlib import suppress
+import unicodedata
 
 DB_FILE = "pagos_pepac.sqlite3"
 
@@ -23,12 +31,11 @@ def iso(d: date) -> str: return d.strftime("%Y-%m-%d")
 def fmt_dmy(d: date) -> str: return d.strftime("%d/%m/%Y")
 
 def parse_ddmmyyyy(s: str) -> date | None:
-    s = s.strip()
+    s = (s or "").strip()
     if not s: return None
     for fmt in ("%d/%m/%Y","%d/%m/%y","%Y-%m-%d"):
         try: return datetime.strptime(s, fmt).date()
         except Exception: pass
-    # dd-mm-aaaa
     try:
         s2 = s.replace("-", "/")
         return datetime.strptime(s2, "%d/%m/%Y").date()
@@ -40,6 +47,10 @@ def daterange(d1: date, d2: date):
     while cur <= d2:
         yield cur
         cur += timedelta(days=1)
+
+def strip_accents_lower(s: str) -> str:
+    s = str(s or "")
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
 
 # -------------------- BD (hilo-seguro) --------------------
 class PaymentsDB:
@@ -60,7 +71,7 @@ class PaymentsDB:
                     fondo TEXT NOT NULL,
                     detalle TEXT NOT NULL,
                     fuente TEXT DEFAULT '',
-                    origen TEXT NOT NULL CHECK (origen IN ('manual','web','heuristica')),
+                    origen TEXT NOT NULL CHECK (origen IN ('manual','web','heuristica','info')),
                     created_at TEXT DEFAULT (datetime('now'))
                 )
             """)
@@ -72,7 +83,7 @@ class PaymentsDB:
         with self._lock:
             self.conn.execute(
                 "INSERT OR IGNORE INTO pagos(fecha,tipo,fondo,detalle,fuente,origen) VALUES (?,?,?,?,?,?)",
-                (iso(d), tipo.strip(), fondo.strip(), detalle.strip(), fuente.strip(), origen))
+                (iso(d), (tipo or "").strip(), (fondo or "—").strip(), (detalle or "").strip(), (fuente or "").strip(), origen))
             self.conn.commit()
 
     def add_range(self, d1: date, d2: date, **kwargs):
@@ -80,7 +91,7 @@ class PaymentsDB:
             cur=self.conn.cursor()
             for d in daterange(d1,d2):
                 cur.execute("INSERT OR IGNORE INTO pagos(fecha,tipo,fondo,detalle,fuente,origen) VALUES (?,?,?,?,?,?)",
-                            (iso(d), kwargs.get("tipo",""), kwargs.get("fondo",""),
+                            (iso(d), kwargs.get("tipo",""), kwargs.get("fondo","—"),
                              kwargs.get("detalle",""), kwargs.get("fuente",""), kwargs.get("origen","manual")))
             self.conn.commit()
 
@@ -154,7 +165,6 @@ class FeagaRef:
                 out.append({"fecha": iso(d), "tipo": tipo, "fondo":"FEAGA",
                             "detalle": f"Ventana general ({a.strftime('%d/%m')}–{b.strftime('%d/%m')}). Campaña {cy}.",
                             "fuente":"Referencia FEAGA", "origen":"info"})
-        # Recordatorio FEADER
         out.append({"fecha": iso(d), "tipo": "Referencia: FEADER (desarrollo rural)",
                     "fondo":"FEADER", "detalle":"Pagos según resoluciones/convocatorias autonómicas.",
                     "fuente":"Referencia", "origen":"info"})
@@ -178,19 +188,42 @@ class FeagaRef:
             rows.append({"fecha": iso(d), "tipo":"Referencia mes: Sin pagos FEAGA generales",
                          "fondo":"—", "detalle":"Fuera de ventanas de anticipo/saldo en este mes.",
                          "fuente":"Referencia FEAGA", "origen":"info"})
-        # Añadimos recordatorio FEADER
         rows.append({"fecha": iso(d), "tipo": "Referencia: FEADER (desarrollo rural)",
                      "fondo":"FEADER", "detalle":"Pagos según resoluciones/convocatorias autonómicas.",
                      "fuente":"Referencia", "origen":"info"})
         return rows
 
-# -------------------- Scraper web (opcional, etiquetas más claras) --------------------
+# -------------------- Helpers visual/agrupaciones --------------------
+def group_by_fondo(rows: list[dict]) -> dict[str, list[dict]]:
+    buckets = defaultdict(list)
+    for r in rows:
+        buckets[(r.get("fondo") or "—").upper()].append(r)
+    return buckets
+
+def top_k_types(rows: list[dict], k=3) -> list[str]:
+    cnt = Counter((r.get("tipo","").strip() or "—") for r in rows)
+    return [t for t,_ in cnt.most_common(k)]
+
+def short_date_esp(iso_str: str) -> str:
+    try:
+        return datetime.strptime(iso_str, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return iso_str
+
+def recast_as_month_item(day_dt: date, original_row: dict) -> dict:
+    row = dict(original_row)
+    iso_day = iso(day_dt)
+    original_iso = row.get("fecha", iso_day)
+    row["fecha"] = iso_day
+    row["origen"] = "info"
+    pref = "Del mes · "
+    row["detalle"] = f"{pref}{row.get('detalle','')}".strip()
+    if original_iso and original_iso != iso_day:
+        row["detalle"] += f" (original: {short_date_esp(original_iso)})"
+    return row
+
+# -------------------- Scraper web (simple FEGA) --------------------
 class FegaWebScraper:
-    """
-    Muy simple: lee 3 notas públicas y graba ventanas completas.
-    Objetivo: tener “fuente web” diferenciada (anticipos ecorregímenes/AAS, saldo EERR),
-    no sustituir resoluciones autonómicas.
-    """
     NOTE_URLS = [
         ("Anticipo ecorregímenes", "https://www.fega.gob.es/sites/default/files/files/document/Nota_web_Ecorregimenes_Ca_2024_ANTICIPO.pdf"),
         ("Anticipo ayudas asociadas", "https://www.fega.gob.es/sites/default/files/files/document/Nota_Web_AAS_Ca_2024_ANTICIPO.pdf"),
@@ -216,7 +249,6 @@ class FegaWebScraper:
                 content=url
             m=re.search(r"(20\d{2})", content)
             y=int(m.group(1)) if m else (year_hint or date.today().year)
-            # Ventanas estándar
             ant1=date(y,10,16); ant2=date(y,11,30)
             sal1=date(y,12,1);  sal2=date(y+1,6,30)
             if "Anticipo" in etiqueta:
@@ -227,6 +259,98 @@ class FegaWebScraper:
                 db.add_range(sal1, sal2, tipo=etiqueta, fondo="FEAGA",
                              detalle="Ventana general de saldos (nota FEAGA).",
                              fuente=url, origen="web")
+
+# -------------------- Scraper multi-fuente --------------------
+class MultiSourceScraper:
+    EXTRA_SOURCES = [
+        # ("Aragón – Noticias PAC", "https://www.aragon.es/en/-/noticias-pac"),
+    ]
+    FEAGA_KEYWORDS = ("feaga", "ecorregimenes", "ecorregímenes", "asociadas", "anticipo", "saldo")
+    FEADER_KEYWORDS = ("feader", "desarrollo rural", "leader")
+
+    def __init__(self):
+        try:
+            import requests  # noqa
+            self._ok = True
+        except Exception:
+            self._ok = False
+
+    def available(self): return self._ok
+
+    def _classify_fondo(self, text: str) -> str:
+        t = strip_accents_lower(text)
+        if any(k in t for k in self.FEADER_KEYWORDS): return "FEADER"
+        if any(k in t for k in self.FEAGA_KEYWORDS): return "FEAGA"
+        return "—"
+
+    def fetch_into_db(self, db: PaymentsDB, year_hint:int|None=None):
+        if not self._ok: raise RuntimeError("Falta 'requests'.")
+        FegaWebScraper().fetch_into_db(db, year_hint=year_hint)
+        with suppress(Exception):
+            self._fetch_fega_news(db, year_hint)
+        for name, url in self.EXTRA_SOURCES:
+            with suppress(Exception):
+                self._fetch_generic_html(db, url, label=name)
+
+    def _fetch_fega_news(self, db: PaymentsDB, year_hint:int|None):
+        import requests
+        base = "https://www.fega.gob.es/es/noticias"
+        r = requests.get(base, timeout=15)
+        if r.status_code != 200: return
+        html = r.text
+        links = re.findall(r'href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I|re.S)
+        for href, title in links:
+            t = re.sub(r"<.*?>", "", title).strip()
+            if not t: continue
+            tl = strip_accents_lower(t)
+            if not any(k in tl for k in ("anticipo","saldo","ecorreg","asociad","pago")):
+                continue
+            m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-](20\d{2}))", href + " " + t)
+            y = None
+            if m:
+                d = parse_ddmmyyyy(m.group(1))
+                y = d.year if isinstance(d, date) else None
+            y = y or year_hint or date.today().year
+            etiqueta = t[:120]
+            if any(k in tl for k in ("anticipo","ecorreg","asociad")):
+                ant1=date(y,10,16); ant2=date(y,11,30)
+                db.add_range(ant1, ant2, tipo=f"[Noticias FEGA] {etiqueta}", fondo="FEAGA",
+                             detalle="Ventana general (anticipo) detectada en noticias FEGA.",
+                             fuente=(href if href.startswith("http") else base), origen="web")
+            elif "saldo" in tl:
+                sal1=date(y,12,1);  sal2=date(y+1,6,30)
+                db.add_range(sal1, sal2, tipo=f"[Noticias FEGA] {etiqueta}", fondo="FEAGA",
+                             detalle="Ventana general (saldo) detectada en noticias FEGA.",
+                             fuente=(href if href.startswith("http") else base), origen="web")
+
+    def _fetch_generic_html(self, db: PaymentsDB, url: str, label: str):
+        import requests
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200: return
+        text = r.text
+        links = re.findall(r'href="([^"]+)"[^>]*>(.*?)</a>', text, flags=re.I|re.S)
+        for href, title in links:
+            t = re.sub(r"<.*?>", "", title).strip()
+            if not t: continue
+            fondo = self._classify_fondo(t)
+            if fondo == "—": continue
+            m = re.search(r"(20\d{2})", href + " " + t)
+            y = int(m.group(1)) if m else date.today().year
+            if "anticipo" in strip_accents_lower(t):
+                ant1=date(y,10,16); ant2=date(y,11,30)
+                db.add_range(ant1, ant2, tipo=f"[{label}] {t[:120]}", fondo=fondo,
+                             detalle="Ventana (anticipo) detectada.",
+                             fuente=(href if href.startswith("http") else url), origen="web")
+            elif "saldo" in strip_accents_lower(t):
+                sal1=date(y,12,1);  sal2=date(y+1,6,30)
+                db.add_range(sal1, sal2, tipo=f"[{label}] {t[:120]}", fondo=fondo,
+                             detalle="Ventana (saldo) detectada.",
+                             fuente=(href if href.startswith("http") else url), origen="web")
+            else:
+                d1 = date(y, date.today().month, 1)
+                db.add(d1, tipo=f"[{label}] {t[:120]}", fondo=fondo,
+                       detalle="Información mensual detectada (sin día exacto).",
+                       fuente=(href if href.startswith("http") else url), origen="web")
 
 # -------------------- StatusBar pastel --------------------
 class StatusBar(tk.Frame):
@@ -407,6 +531,117 @@ class YearCalendarFrame(ttk.Frame):
     def _next(self): self._set(self.current_year+1)
     def _go_today(self): self.go_to_date(date.today())
 
+# -------------------- Visual de Hitos del Mes --------------------
+class MonthHitosDialog(tk.Toplevel):
+    def __init__(self, app: "App", year: int, month: int):
+        super().__init__(app)
+        self.app = app
+        self.title(f"Hitos {month:02d}/{year}")
+        self.transient(app.winfo_toplevel()); self.grab_set()
+        self.configure(bg="#f7f9fc")
+        self._build(year, month)
+
+    def _build(self, y:int, m:int):
+        top = tk.Frame(self, bg="#e7f0ff", highlightbackground="#cddcfb", highlightthickness=1)
+        tk.Label(top, text=f"Hitos del mes {m:02d}/{y}", bg="#e7f0ff", fg="#093a76",
+                 font=("Segoe UI",11,"bold")).pack(side="left", padx=10, pady=6)
+        tk.Button(top, text="Exportar mes (CSV)", command=lambda:self._export_csv(y,m)).pack(side="right", padx=8, pady=6)
+        top.pack(fill="x")
+
+        grid = tk.Frame(self, bg="#f7f9fc")
+        grid.pack(fill="both", expand=True, padx=8, pady=8)
+
+        leg = tk.Frame(self, bg="#f7f9fc"); leg.pack(fill="x", padx=10)
+        def badge(color, txt):
+            box=tk.Frame(leg,bg=color,width=16,height=12,highlightthickness=1,highlightbackground="#aaa")
+            box.pack(side="left", padx=(6,4), pady=2)
+            tk.Label(leg, text=txt, bg="#f7f9fc").pack(side="left", padx=(0,10))
+        badge("#e8fff3","Manual / Web")
+        badge("#eef5ff","Referencia FEAGA")
+        badge("#e7f3fe","Información (del mes)")
+
+        month_rows = self.app.db.get_month(y, m, origins=None)
+        by_day = defaultdict(list)
+        for r in month_rows:
+            by_day[r["fecha"]].append(r)
+
+        weeks = calendar.monthcalendar(y, m)
+        for rr, week in enumerate(weeks):
+            rowf = tk.Frame(grid, bg="#f7f9fc"); rowf.grid(row=rr, column=0, sticky="ew", pady=2)
+            for cc, dd in enumerate(week):
+                cell = tk.Frame(rowf, bd=1, relief="solid", bg="#ffffff")
+                cell.pack(side="left", padx=2, pady=2)
+                cell.configure(width=170, height=110)
+                cell.pack_propagate(False)
+                if dd == 0:
+                    tk.Label(cell, text="", bg="#ffffff").pack()
+                    continue
+                dt = date(y,m,dd); iso_dt = iso(dt)
+                rows = list(by_day.get(iso_dt, []))
+                for ref in FeagaRef.day_in_any_window(dt):
+                    rows.append(ref)
+
+                hdr = tk.Frame(cell, bg="#f1f6ff"); hdr.pack(fill="x")
+                tk.Label(hdr, text=str(dd), bg="#f1f6ff", fg="#093a76",
+                         font=("Segoe UI",10,"bold")).pack(side="left", padx=6)
+
+                buckets = group_by_fondo(rows)
+                line = tk.Frame(cell, bg="#ffffff"); line.pack(fill="x", padx=6, pady=(2,0))
+                feaga_n = len(buckets.get("FEAGA", []))
+                feader_n = len(buckets.get("FEADER", []))
+                tk.Label(line, text=f"FEAGA: {feaga_n}", bg="#ffffff").pack(side="left")
+                tk.Label(line, text=f"  FEADER: {feader_n}", bg="#ffffff").pack(side="left", padx=(8,0))
+
+                chips = top_k_types(rows, k=3)
+                chipsf = tk.Frame(cell, bg="#ffffff"); chipsf.pack(fill="x", padx=6, pady=(4,2))
+                for t in chips:
+                    lab = tk.Label(chipsf, text=f"• {t}", bg="#eef5ff", fg="#093a76")
+                    lab.pack(anchor="w", fill="x", pady=1)
+
+                tip = "\n".join(
+                    f"{(r.get('fondo') or '—')}: {r.get('tipo','—')} — {r.get('detalle','').strip()[:140]}"
+                    for r in rows[:8]
+                ) + ("" if len(rows)<=8 else f"\n… (+{len(rows)-8} más)")
+                self._bind_tooltip(cell, tip)
+
+                cell.bind("<Button-1>", lambda _e, dti=dt: self._goto_day(dti))
+                for w in cell.winfo_children():
+                    w.bind("<Button-1>", lambda _e, dti=dt: self._goto_day(dti))
+
+        self.geometry("900x720")
+
+    def _goto_day(self, d: date):
+        self.destroy()
+        self.app.tabs.select(0)
+        self.app.yearcal.go_to_date(d)
+        self.app._show_day(d)
+
+    def _export_csv(self, y:int, m:int):
+        import csv, os
+        rows = self.app.db.get_month(y, m, origins=None)
+        if not rows:
+            messagebox.showinfo("Exportar", "No hay filas para ese mes.")
+            return
+        path = f"pagos_{y}_{m:02d}.csv"
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["fecha","tipo","fondo","detalle","origen","fuente"])
+            for r in rows:
+                w.writerow([r.get("fecha",""), r.get("tipo",""), r.get("fondo",""), r.get("detalle",""), r.get("origen",""), r.get("fuente","")])
+        messagebox.showinfo("Exportar", f"Exportado: {os.path.abspath(path)}")
+
+    def _bind_tooltip(self, widget, text: str):
+        tip = tk.Toplevel(widget); tip.withdraw(); tip.overrideredirect(True)
+        lbl = tk.Label(tip, text=text, bg="#ffffe0", justify="left", relief="solid", borderwidth=1, font=("Segoe UI",9))
+        lbl.pack(ipadx=4, ipady=2)
+        def enter(_):
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + 10
+            tip.geometry(f"+{x}+{y}"); tip.deiconify()
+        def leave(_):
+            tip.withdraw()
+        widget.bind("<Enter>", enter); widget.bind("<Leave>", leave)
+
 # -------------------- Panel de pagos --------------------
 class PaymentsInfoFrame(ttk.Frame):
     ORIGIN_LABEL = {"manual":"Manual","web":"Web","heuristica":"Referencia FEAGA","info":"Información"}
@@ -462,7 +697,7 @@ class PaymentsInfoFrame(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         for r in rows:
             label = self.ORIGIN_LABEL.get(r.get("origen",""), r.get("origen",""))
-            vals=(r.get("fecha",""), r["tipo"], r["fondo"], r["detalle"], label, r.get("fuente",""))
+            vals=(r.get("fecha",""), r.get("tipo",""), r.get("fondo",""), r.get("detalle",""), label, r.get("fuente",""))
             self.tree.insert("", "end", values=vals, tags=(r.get("origen",""),))
         self.update_idletasks()
 
@@ -501,7 +736,7 @@ class App(tk.Frame):
         self.pack(fill="both",expand=True)
 
         title=tk.Frame(self,bg="#f0f7ff")
-        tk.Label(title,text="Calendario FEAGA / FEADER – v3.5.0",
+        tk.Label(title,text="Calendario FEAGA / FEADER – v3.8.0",
                  bg="#f0f7ff",fg="#053e7b",font=("Segoe UI",13,"bold")).pack(side="left",padx=10,pady=8)
         title.pack(fill="x")
 
@@ -510,12 +745,12 @@ class App(tk.Frame):
 
         top=tk.Frame(self,bg="#eef5ff",highlightbackground="#cddcfb",highlightthickness=1)
         self._color_btn(top,"Pagos de hoy","#2e7d32", lambda: self._show_day(date.today())).pack(side="left", padx=(8,4), pady=6)
-        self._color_btn(top,"Mostrar pagos del mes","#0d6efd", self._show_month_of_selected).pack(side="left", padx=4, pady=6)
+        self._color_btn(top,"Hitos del mes (visual)","#0d6efd", self._show_month_visual_of_selected).pack(side="left", padx=4, pady=6)
+        ttk.Button(top,text="Listado del mes",command=self._show_month_of_selected).pack(side="left", padx=6, pady=6)
         ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog).pack(side="left", padx=6, pady=6)
         ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog).pack(side="left", padx=(12,4), pady=6)
         ttk.Button(top,text="Borrar pagos del día…",command=self._delete_selected_day_dialog).pack(side="left", padx=4, pady=6)
 
-        # Limpiar panel (tk.Button para poder parpadear)
         self.clear_btn = tk.Button(top,text="Limpiar panel",bg="#9c27b0",fg="white",
                                    activebackground="#9c27b0",relief="raised",bd=1,highlightthickness=0,
                                    command=self._clear_view)
@@ -566,7 +801,6 @@ class App(tk.Frame):
 
     # ---------- Parpadeo del botón Limpiar panel ----------
     def _blink_clear_button(self, cycles:int=6, interval:int=180):
-        # Reinicia si ya estaba parpadeando
         if self._blink_job:
             try: self.after_cancel(self._blink_job)
             except Exception: pass
@@ -586,7 +820,6 @@ class App(tk.Frame):
 
     # ---------- Utilidades UI ----------
     def _clear_view(self):
-        # Detener parpadeo si lo hubiera
         if self._blink_job:
             try: self.after_cancel(self._blink_job)
             except Exception: pass
@@ -660,25 +893,62 @@ class App(tk.Frame):
         if self.show_heur.get(): s.add("heuristica")
         return s or {"manual","web","heuristica"}
 
-    # Mostrar día (dispara parpadeo)
+    # Mostrar día (con caídas a mes y referencia)
     def _show_day(self, dt: date):
         self._current_dt=dt
-        rows=self.db.get_day(dt, self._active_origins())
-        for r in rows: r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
-        if rows:
-            self.pay_frame.show_rows(f"Día {fmt_dmy(dt)}", rows)
-            self.console.show("ok", f"Mostrando {len(rows)} pago(s) para {fmt_dmy(dt)}.")
-        else:
-            gen = FeagaRef.day_in_any_window(dt) or FeagaRef.month_generic_for_day(dt)
-            for r in gen: r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
+        rows = self.db.get_day(dt, self._active_origins())
+
+        def has_day_fondo(fondo:str)->bool:
+            return any((r.get("fondo","").upper()==fondo and r.get("origen") in ("manual","web")) for r in rows)
+
+        day_has_feaga = has_day_fondo("FEAGA")
+        day_has_feader = has_day_fondo("FEADER")
+
+        if not rows:
+            gen = FeagaRef.day_in_any_window(dt) or []
+            month_rows = self.db.get_month(dt.year, dt.month, self._active_origins())
+            feader_month = [r for r in month_rows if (r.get("fondo","").upper()=="FEADER")]
+            for r in feader_month[:12]:
+                gen.append(recast_as_month_item(dt, r))
+            if not gen:
+                gen = FeagaRef.month_generic_for_day(dt)
+            for r in gen:
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", r.get("fecha","")):
+                    r["fecha"] = fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
             self.pay_frame.show_rows(f"Día {fmt_dmy(dt)} (referencia)", gen)
-            self.console.show("info", f"No hay pagos guardados para {fmt_dmy(dt)}. Mostrando referencias FEAGA/FEADER.")
-        # ¡Parpadeo!
+            self.console.show("info", f"No hay pagos guardados para {fmt_dmy(dt)}. Se muestran referencias FEAGA y, si hay, FEADER del mes.")
+            self._blink_clear_button()
+            return
+
+        if not day_has_feaga:
+            for ref in FeagaRef.day_in_any_window(dt):
+                rows.append(ref)
+
+        month_rows = self.db.get_month(dt.year, dt.month, self._active_origins())
+
+        if not day_has_feaga:
+            feaga_month = [r for r in month_rows if r.get("fondo","").upper()=="FEAGA"]
+            for r in feaga_month[:20]:
+                rows.append(recast_as_month_item(dt, r))
+
+        if not day_has_feader:
+            feader_month = [r for r in month_rows if r.get("fondo","").upper()=="FEADER"]
+            for r in feader_month[:20]:
+                rows.append(recast_as_month_item(dt, r))
+
+        for r in rows:
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", r.get("fecha","")):
+                r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
+
+        self.pay_frame.show_rows(f"Día {fmt_dmy(dt)}", rows)
+        self.console.show("ok", f"Mostrando {len(rows)} elemento(s) para {fmt_dmy(dt)} (con caídas a mes si aplican).")
         self._blink_clear_button()
 
     def _show_month(self, y:int, m:int):
         rows=self.db.get_month(y,m, self._active_origins())
-        for r in rows: r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
+        for r in rows:
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", r.get("fecha","")):
+                r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
         if not rows:
             self.pay_frame.clear("—")
             self.console.show("warn", f"No hay pagos en {m:02d}/{y} con los filtros actuales.")
@@ -692,7 +962,10 @@ class App(tk.Frame):
         dt=self.yearcal.get_selected_date() or date.today()
         self._show_month(dt.year, dt.month)
 
-    # Rango
+    def _show_month_visual_of_selected(self):
+        dt = self.yearcal.get_selected_date() or date.today()
+        MonthHitosDialog(self, dt.year, dt.month)
+
     def _show_range_dialog(self):
         dlg=tk.Toplevel(self); dlg.title("Buscar por rango"); dlg.transient(self.winfo_toplevel()); dlg.grab_set()
         ttk.Label(dlg,text="Desde (dd/mm/aaaa):").grid(row=0,column=0,sticky="e",padx=6,pady=6)
@@ -706,7 +979,9 @@ class App(tk.Frame):
             d1=parse_ddmmyyyy(e1.get()); d2=parse_ddmmyyyy(e2.get())
             if not d1 or not d2 or d1>d2: messagebox.showerror("Rango","Fechas inválidas."); return
             rows=self.db.get_range(d1,d2, self._active_origins())
-            for r in rows: r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
+            for r in rows:
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", r.get("fecha","")):
+                    r["fecha"]=fmt_dmy(datetime.strptime(r["fecha"],"%Y-%m-%d").date())
             if not rows:
                 self.pay_frame.clear("—"); self.console.show("warn","Sin resultados con los filtros actuales.")
             else:
@@ -790,7 +1065,7 @@ class App(tk.Frame):
 
     # -------------------- Importar Excel/CSV --------------------
     @staticmethod
-    def _norm(s:str)->str: return re.sub(r"[^a-z]", "", str(s).lower())
+    def _norm(s:str)->str: return re.sub(r"[^a-z]", "", strip_accents_lower(s))
 
     def _find_col(self, columns, candidates)->str|None:
         cn=[self._norm(x) for x in candidates]
@@ -800,6 +1075,21 @@ class App(tk.Frame):
             nc=self._norm(c)
             if any(x in nc for x in cn): return c
         return None
+
+    def _ask_year(self, default:int) -> int | None:
+        dlg=tk.Toplevel(self); dlg.title("Año destino"); dlg.transient(self.winfo_toplevel()); dlg.grab_set()
+        ttk.Label(dlg,text="Año destino para los hitos del Excel:").grid(row=0,column=0,sticky="e",padx=8,pady=8)
+        var=tk.IntVar(value=default)
+        sp=ttk.Spinbox(dlg,from_=2000,to=2100,width=6,textvariable=var,justify="center")
+        sp.grid(row=0,column=1,sticky="w",padx=8,pady=8)
+        ans={"ok":False}
+        def ok(): ans["ok"]=True; dlg.destroy()
+        def cancel(): dlg.destroy()
+        btns=ttk.Frame(dlg); btns.grid(row=1,column=0,columnspan=2,pady=(0,8))
+        ttk.Button(btns,text="Aceptar",command=ok).pack(side="left",padx=6)
+        ttk.Button(btns,text="Cancelar",command=cancel).pack(side="left",padx=6)
+        dlg.wait_window(dlg)
+        return var.get() if ans["ok"] else None
 
     def _import_excel(self):
         path=filedialog.askopenfilename(
@@ -824,6 +1114,23 @@ class App(tk.Frame):
         if df.empty:
             messagebox.showinfo("Excel","El fichero no tiene filas."); return
 
+        # Mapeo especial Aragón (Mes/Actividad/Ayuda FEAGA/Ayuda FEADER)
+        c_mes   = self._find_col(df.columns, ["mes"])
+        c_act   = self._find_col(df.columns, ["actividad","observaciones","descripcion","descripción"])
+        c_fea   = self._find_col(df.columns, ["ayuda feaga","feaga"])
+        c_fed   = self._find_col(df.columns, ["ayuda feader","feader"])
+
+        if c_mes and c_act and (c_fea or c_fed):
+            y = self._ask_year(self.yearcal.current_year)
+            if y is None: return
+            inserted, skipped, errs = self._import_aragon_calendar_df(df, c_mes, c_act, c_fea, c_fed, y)
+            self.yearcal.refresh(); self._refresh_current_view(); self._refresh_index_tab()
+            msg=f"Importación (Aragón) completada.\nInsertados: {inserted}\nOmitidos: {skipped}"
+            if errs: msg += f"\n\nPrimeros errores:\n" + "\n".join(errs[:10])
+            messagebox.showinfo("Excel", msg)
+            return
+
+        # Importador genérico (Fecha/Tipo/Fondo/Detalle/Fuente)
         c_fecha  = self._find_col(df.columns, ["fecha","día","dia","date"])
         c_tipo   = self._find_col(df.columns, ["tipo","concepto","pago","descripcion","descripción"])
         c_fondo  = self._find_col(df.columns, ["fondo","feaga","feader","linea","línea"])
@@ -862,28 +1169,182 @@ class App(tk.Frame):
         if errs: msg += f"\n\nPrimeros errores:\n" + "\n".join(errs[:10])
         messagebox.showinfo("Excel", msg)
 
+    # --- Importador especializado: Excel Aragón (Mes/Actividad/FEAGA/FEADER) ---
+    def _import_aragon_calendar_df(self, df, c_mes, c_act, c_fea, c_fed, year:int):
+        meses_map = {
+            "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+            "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+        }
+        def parse_month_name(s: str) -> int|None:
+            k = strip_accents_lower(s).strip()
+            return meses_map.get(k)
+
+        def end_of_month(y,m):
+            return date(y,m,calendar.monthrange(y,m)[1])
+
+        # Patrones de fechas en español
+        meses_regex = "(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)"
+        rx_del_al_de_mes = re.compile(rf"\bdel\s+(\d{{1,2}})\s+al\s+(\d{{1,2}})\s+de\s+{meses_regex}\b", re.I)
+        rx_del_al         = re.compile(r"\bdel\s+(\d{1,2})\s+al\s+(\d{1,2})\b", re.I)
+        rx_a_partir_de_mes= re.compile(rf"\ba\s+partir\s+del\s+(\d{{1,2}})\s+de\s+{meses_regex}\b", re.I)
+        rx_a_partir       = re.compile(r"\ba\s+partir\s+del\s+(\d{1,2})\b", re.I)
+        rx_dia_de_mes     = re.compile(rf"\b(\d{{1,2}})\s+de\s+{meses_regex}\b", re.I)
+        rx_dia_suelto     = re.compile(r"\b(\d{1,2})\b")
+
+        def clean_tipo_det(line: str) -> tuple[str,str]:
+            txt = line.strip().lstrip("-").strip()
+            if ":" in txt:
+                left, right = txt.split(":",1)
+                tipo = right.strip()
+                if not tipo: tipo = txt[:80]
+                return (tipo, txt)
+            return (txt[:80], txt)
+
+        def yes_col(val) -> bool:
+            t = strip_accents_lower(val).strip()
+            return t.startswith("si") or t.startswith("sí")
+
+        inserted=0; skipped=0; errs=[]
+        for i,row in df.iterrows():
+            try:
+                mes_txt = row[c_mes]
+                m = parse_month_name(mes_txt)
+                if not m:
+                    skipped+=1; errs.append(f"Fila {i+2}: mes inválido '{mes_txt}'"); continue
+                act_text = str(row[c_act] or "").strip()
+                if not act_text:
+                    skipped+=1; errs.append(f"Fila {i+2}: actividad vacía"); continue
+                is_feaga = yes_col(row[c_fea]) if c_fea else False
+                is_feader= yes_col(row[c_fed]) if c_fed else False
+                if not (is_feaga or is_feader):
+                    # Si ninguna ayuda aplica, lo dejamos como informativo general del mes (—) en día 1
+                    d = date(year, m, 1)
+                    tipo, detalle = clean_tipo_det(act_text.splitlines()[0])
+                    self.db.add(d, tipo, "—", f"[Mes] {detalle}", "Excel Aragón (Calendario)", origen="manual")
+                    inserted += 1
+                    continue
+
+                # Divide en líneas para detectar múltiples hitos
+                lines = [ln.strip() for ln in act_text.splitlines() if ln.strip()]
+                if not lines:
+                    lines = [act_text]
+
+                for ln in lines:
+                    ln_clean = strip_accents_lower(ln)
+
+                    # 1) "Del X al Y de MES"
+                    m1 = rx_del_al_de_mes.search(ln_clean)
+                    if m1:
+                        d1, d2, mesname = int(m1.group(1)), int(m1.group(2)), m1.group(3)
+                        mm = parse_month_name(mesname)
+                        if not mm: mm = m
+                        start = date(year, mm, d1)
+                        end = date(year, mm, d2)
+                        tipo, detalle = clean_tipo_det(ln)
+                        if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        inserted += (d2 - d1 + 1)
+                        continue
+
+                    # 2) "Del X al Y" (mes por defecto)
+                    m2 = rx_del_al.search(ln_clean)
+                    if m2:
+                        d1, d2 = int(m2.group(1)), int(m2.group(2))
+                        start = date(year, m, d1)
+                        end = date(year, m, d2)
+                        tipo, detalle = clean_tipo_det(ln)
+                        if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        inserted += (d2 - d1 + 1)
+                        continue
+
+                    # 3) "A partir del X de MES"
+                    m3 = rx_a_partir_de_mes.search(ln_clean)
+                    if m3:
+                        d1, mesname = int(m3.group(1)), m3.group(2)
+                        mm = parse_month_name(mesname)
+                        if not mm: mm = m
+                        start = date(year, mm, d1)
+                        end = end_of_month(year, mm)
+                        tipo, detalle = clean_tipo_det(ln)
+                        if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        inserted += (end - start).days + 1
+                        continue
+
+                    # 4) "A partir del X" (mes por defecto)
+                    m4 = rx_a_partir.search(ln_clean)
+                    if m4:
+                        d1 = int(m4.group(1))
+                        start = date(year, m, d1)
+                        end = end_of_month(year, m)
+                        tipo, detalle = clean_tipo_det(ln)
+                        if is_feaga: self.db.add_range(start, end, tipo=tipo, fondo="FEAGA", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        if is_feader: self.db.add_range(start, end, tipo=tipo, fondo="FEADER", detalle=detalle, fuente="Excel Aragón (Calendario)", origen="manual")
+                        inserted += (end - start).days + 1
+                        continue
+
+                    # 5) "X de MES" → día concreto
+                    m5 = rx_dia_de_mes.search(ln_clean)
+                    if m5:
+                        d1, mesname = int(m5.group(1)), m5.group(2)
+                        mm = parse_month_name(mesname)
+                        if not mm: mm = m
+                        theday = date(year, mm, d1)
+                        tipo, detalle = clean_tipo_det(ln)
+                        if is_feaga: self.db.add(theday, tipo, "FEAGA", detalle, "Excel Aragón (Calendario)", origen="manual")
+                        if is_feader: self.db.add(theday, tipo, "FEADER", detalle, "Excel Aragón (Calendario)", origen="manual")
+                        inserted += 1
+                        continue
+
+                    # 6) "X" solo (número suelto) → interpretamos día del mes por defecto si el contexto lo sugiere
+                    m6 = rx_dia_suelto.search(ln_clean)
+                    if m6 and ":" in ln:
+                        try:
+                            d1 = int(m6.group(1))
+                            theday = date(year, m, d1)
+                            tipo, detalle = clean_tipo_det(ln)
+                            if is_feaga: self.db.add(theday, tipo, "FEAGA", detalle, "Excel Aragón (Calendario)", origen="manual")
+                            if is_feader: self.db.add(theday, tipo, "FEADER", detalle, "Excel Aragón (Calendario)", origen="manual")
+                            inserted += 1
+                            continue
+                        except Exception:
+                            pass
+
+                    # 7) Sin fecha explícita → anotamos día 1 del mes como marcador
+                    theday = date(year, m, 1)
+                    tipo, detalle = clean_tipo_det(ln)
+                    if is_feaga: self.db.add(theday, tipo, "FEAGA", f"[Mes] {detalle}", "Excel Aragón (Calendario)", origen="manual")
+                    if is_feader: self.db.add(theday, tipo, "FEADER", f"[Mes] {detalle}", "Excel Aragón (Calendario)", origen="manual")
+                    inserted += 1
+
+            except Exception as ex:
+                skipped+=1; errs.append(f"Fila {i+2}: {ex}")
+
+        return inserted, skipped, errs
+
     # Web (hilo seguro + messagebox)
     def _update_from_web(self):
         def run():
             try:
-                sc=FegaWebScraper()
+                sc=MultiSourceScraper()
                 if not sc.available(): raise RuntimeError("Falta 'requests'.")
                 sc.fetch_into_db(self.db, year_hint=date.today().year)
                 self.after(0, lambda:(self.yearcal.refresh(),
                                       self._refresh_current_view(),
                                       self._refresh_index_tab(),
-                                      self.console.show("ok","Pagos actualizados desde FEAGA (web)."),
-                                      messagebox.showinfo("Web","Pagos actualizados desde FEAGA (web).")))
+                                      self.console.show("ok","Pagos actualizados desde múltiples fuentes web."),
+                                      messagebox.showinfo("Web","Pagos actualizados desde múltiples fuentes web.")))
             except Exception as ex:
                 self.after(0, lambda: (self.console.show("error", f"No se pudo completar la descarga: {ex}"),
                                        messagebox.showerror("Web", f"No se pudo completar la descarga:\n{ex}")))
         threading.Thread(target=run,daemon=True).start()
-        self.console.show("warn","Buscando ventanas en notas FEAGA… (se guardarán como origen 'web').")
+        self.console.show("warn","Buscando pagos/ventanas en FEGA (PDF, noticias) y fuentes extra…")
 
 # -------------------- main --------------------
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v3.5.0")
+    root.title("Calendario FEAGA/FEADER – v3.8.0")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
