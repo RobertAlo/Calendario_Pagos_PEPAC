@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – [v4.2.0 estable VERSION]_DEF
+Calendario FEAGA/FEADER – [v4.2.0 estable VERSION]_BETA
 
 Novedades en esta versión:
 - Hitos del mes (visual): ventana normal con botones de minimizar/maximizar/cerrar, redimensionable.
