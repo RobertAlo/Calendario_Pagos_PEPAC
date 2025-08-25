@@ -1052,120 +1052,267 @@ class PaymentsInfoFrame(ttk.Frame):
         self.update_idletasks()
 
 # -------------------- SuperCrawler (scraping masivo) --------------------
+
+# -------------------- SuperCrawler (rápido/normal/profundo, con caché/TTL) --------------------
 class SuperCrawler:
     DEFAULT_SEEDS = [
         "https://www.fega.gob.es/es",
         "https://www.fega.gob.es/es/noticias",
-        "https://www.boe.es/",
-        "https://www.boa.aragon.es/",
-        "https://www.aragon.es/organismos/departamento-de-agricultura-ganaderia-y-alimentacion",
+        "https://www.fega.gob.es/sites/default/files/files",
     ]
     ALLOWED_DOMAINS = [
         "fega.gob.es","boe.es","boa.aragon.es","aragon.es",
         "navarra.es","juntadeandalucia.es","castillayleon.es","gencat.cat","juntaex.es","gobcan.es"
     ]
-    KEYWORDS = ["pago","pagos","feaga","feader","anticipo","anticipos","saldo","saldos","calendario","ayudas","resolucion","resolución","orden"]
-    MES = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
+    KEYWORDS = ["pago","pagos","feaga","feader","anticipo","anticipos","saldo","saldos",
+                "ecorr","eerr","ayudas","resolucion","resolución","orden","calendario"]
+    DOC_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".csv")
+    HTML_EXTS = (".html",".htm","")  # sin extensión o html
 
-    def __init__(self, db, seeds=None, max_pages=300, max_depth=3, per_domain=80, log=lambda *_: None, stop_flag=lambda: False):
+    MODE_PROFILES = {
+        "rapido":   dict(max_pages=40, max_depth=2, per_domain=25, ttl_hours=24,  time_budget=60,  max_new_records=40),
+        "normal":   dict(max_pages=120,max_depth=3, per_domain=80, ttl_hours=72,  time_budget=120, max_new_records=120),
+        "profundo": dict(max_pages=300,max_depth=4, per_domain=120,ttl_hours=168, time_budget=240, max_new_records=300),
+    }
+
+    MES = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,
+           "agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
+
+    def __init__(self, db, seeds=None, mode="rapido", log=lambda *_: None, stop_flag=lambda: False,
+                 since_months=6, **overrides):
         self.db = db
         self.seeds = list(seeds or self.DEFAULT_SEEDS)
-        self.max_pages = int(max_pages); self.max_depth = int(max_depth)
-        self.per_domain = int(per_domain); self.log = log; self.stop_flag = stop_flag
+        prof = dict(self.MODE_PROFILES.get(str(mode).lower(), self.MODE_PROFILES["rapido"]))
+        prof.update(overrides or {})
+        self.prof = prof
+        self.log = log
+        self.stop_flag = stop_flag
+        self.since_date = self._months_ago(date.today(), since_months)
+
+    # ---------- utilidades ----------
+    def _months_ago(self, d, months):
+        y, m = d.year, d.month - int(months)
+        while m <= 0:
+            y -= 1
+            m += 12
+        return date(y, m, 1)
 
     def _domain(self, url):
         from urllib.parse import urlparse
         return urlparse(url).netloc.lower()
 
     def _normalize_url(self, base, href):
-        from urllib.parse import urljoin
-        return urljoin(base, href)
+        from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+        u = urljoin(base, href)
+        pr = urlparse(u)
+        q = [(k,v) for (k,v) in parse_qsl(pr.query) if not k.lower().startswith(("utm_","gclid","fbclid"))]
+        pr = pr._replace(query=urlencode(q, doseq=True), fragment="")
+        return urlunparse(pr)
 
     def _allowed(self, url):
-        d = self._domain(url); return any(d.endswith(ad) for ad in self.ALLOWED_DOMAINS)
+        d = self._domain(url)
+        return any(d.endswith(ad) for ad in self.ALLOWED_DOMAINS)
+
+    # ---------- caché/TTL + condicionales ----------
+    def _should_skip_by_ttl(self, url):
+        ttl_h = self.prof["ttl_hours"]
+        with self.db._lock:
+            r = self.db.conn.execute("SELECT fetched_at FROM crawl_cache WHERE url=?", (url,)).fetchone()
+        if not r:
+            return False
+        try:
+            from datetime import datetime
+            fetched = datetime.strptime(r["fetched_at"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return False
+        delta_h = (datetime.utcnow() - fetched).total_seconds() / 3600.0
+        return delta_h < ttl_h
 
     def _fetch(self, url, session):
-        import hashlib
-        headers = {"User-Agent":"Calendario-PEPAC/1.0 (+scraper educativo; contacto usuario)"}
-        r = session.get(url, timeout=15, headers=headers, allow_redirects=True)
-        status = r.status_code; text = r.text if (200 <= status < 300) else ""
-        etag = r.headers.get("ETag",""); lm = r.headers.get("Last-Modified","")
-        h = hashlib.sha256(text.encode("utf-8","ignore")).hexdigest() if text else ""
+        if self._should_skip_by_ttl(url):
+            return 304, ""
+        headers = {"User-Agent":"Calendario-PEPAC/1.0 (crawler educativo)"}
+        etag = last_mod = None
+        with self.db._lock:
+            r = self.db.conn.execute("SELECT etag,last_modified FROM crawl_cache WHERE url=?", (url,)).fetchone()
+        if r:
+            etag = r["etag"] or None
+            last_mod = r["last_modified"] or None
+        if etag:
+            headers["If-None-Match"] = etag
+        if last_mod:
+            headers["If-Modified-Since"] = last_mod
+        try:
+            r = session.get(url, timeout=15, headers=headers, allow_redirects=True)
+        except Exception as e:
+            self.log(f"ERR GET {url}: {e}")
+            return 0, ""
+
+        status = r.status_code
+        text = r.text if (200 <= status < 300) else ""
+        new_etag = r.headers.get("ETag","")
+        lm = r.headers.get("Last-Modified","")
+        try:
+            import hashlib
+            h = hashlib.sha256((text or "").encode("utf-8", "ignore")).hexdigest() if text else ""
+        except Exception:
+            h = ""
         with self.db._lock:
             self.db.conn.execute(
-                "INSERT OR REPLACE INTO crawl_cache(url,etag,last_modified,status,fetched_at,content_hash) VALUES (?,?,?,?,datetime('now'),?)",
-                (url, etag, lm, status, h)
-            ); self.db.conn.commit()
+                "INSERT OR REPLACE INTO crawl_cache(url,etag,last_modified,status,fetched_at,content_hash) "
+                "VALUES (?,?,?,?,datetime('now'),?)",
+                (url, new_etag, lm, status, h)
+            )
+            self.db.conn.commit()
         return status, text
+
+    # ---------- extracción y scoring ----------
+    def _parse_date_text(self, t):
+        import re as _re
+        t = strip_accents_lower(t)
+        m = _re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", t)
+        if m:
+            try:
+                return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            except Exception:
+                pass
+        m = _re.search(r"(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})", t)
+        if m and m.group(2) in self.MES:
+            try:
+                return date(int(m.group(3)), self.MES[m.group(2)], int(m.group(1)))
+            except Exception:
+                pass
+        return None
+
+    def _classify(self, txt):
+        t = strip_accents_lower(txt)
+        fondo = "FEADER" if ("feader" in t or "desarrollo rural" in t) else ("FEAGA" if "feaga" in t else "—")
+        tipo = "Anticipo" if ("anticipo" in t or "anticipos" in t) else ("Saldo" if ("saldo" in t or "saldos" in t) else "Pago")
+        return tipo, fondo
+
+    def _score_link(self, label, href, base_url):
+        t = strip_accents_lower((label or "") + " " + (href or ""))
+        score = 0
+        for kw in self.KEYWORDS:
+            if kw in t:
+                score += 3
+        if "/sites/default/files" in href:
+            score += 5
+        if any(href.lower().endswith(ext) for ext in self.DOC_EXTS):
+            score += 4
+        if self._domain(href) == self._domain(base_url):
+            score += 1
+        return score
 
     def _extract_records(self, base_url, html):
         from bs4 import BeautifulSoup
-        import re as _re
         soup = BeautifulSoup(html, "lxml")
         out = []
-        def parse_date_text(t):
-            t = strip_accents_lower(t)
-            m = _re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", t)
-            if m:
-                try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-                except Exception: pass
-            m = _re.search(r"(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})", t)
-            if m and m.group(2) in self.MES:
-                try: return date(int(m.group(3)), self.MES[m.group(2)], int(m.group(1)))
-                except Exception: pass
-            return None
-        def classify(txt):
-            t = strip_accents_lower(txt)
-            fondo = "FEADER" if "feader" in t or "desarrollo rural" in t else ("FEAGA" if "feaga" in t else "—")
-            tipo = "Anticipo" if "anticipo" in t or "anticipos" in t else ("Saldo" if "saldo" in t or "saldos" in t else "Pago")
-            return tipo, fondo
         for a in soup.find_all("a", href=True):
-            href = a.get("href",""); label = " ".join(a.get_text(" ").split()) or href
-            if not any(k in strip_accents_lower(label + " " + href) for k in self.KEYWORDS): continue
-            url = self._normalize_url(base_url, href)
-            if not self._allowed(url): continue
-            d = parse_date_text(label); tipo, fondo = classify(label); detalle = label
-            out.append({"url": url, "fecha": d, "tipo": tipo, "fondo": fondo, "detalle": detalle, "fuente": url})
+            href = self._normalize_url(base_url, a.get("href",""))
+            label = " ".join(a.get_text(" ").split()) or href
+            if not self._allowed(href):
+                continue
+            if any(href.lower().endswith(ext) for ext in self.DOC_EXTS):
+                d = self._parse_date_text(label) or self._parse_date_text(href)
+                if d and d < self.since_date:
+                    continue
+                tipo, fondo = self._classify(label)
+                out.append({"url": href, "fecha": d or date.today(), "tipo": tipo,
+                            "fondo": fondo, "detalle": label, "fuente": href})
         return out
 
+    # ---------- ejecución ----------
     def run(self):
-        from collections import defaultdict, deque
+        import time
+        from heapq import heappush, heappop
+        from collections import defaultdict
         import requests
-        seen = set(); by_domain = defaultdict(int)
-        q = deque((u,0) for u in self.seeds if self._allowed(u))
+        start_ts = time.time()
+
+        seen = set()
+        per_domain_count = defaultdict(int)
         pages = 0
+        new_records = 0
+
+        heap = []
+        for u in self.seeds:
+            if self._allowed(u):
+                heappush(heap, (-10, 0, u, u))  # (score, depth, url, from_url)
+
         with requests.Session() as s:
-            while q and pages < self.max_pages and not self.stop_flag():
-                url, depth = q.popleft()
-                if url in seen: continue
-                seen.add(url); dom = self._domain(url)
-                if by_domain[dom] >= self.per_domain: continue
-                if depth > self.max_depth: continue
-                pages += 1; by_domain[dom]+=1
+            while heap and not self.stop_flag():
+                if (time.time() - start_ts) > self.prof["time_budget"]:
+                    self.log("Tiempo máximo alcanzado.")
+                    break
+                if pages >= self.prof["max_pages"]:
+                    self.log("Límite de páginas alcanzado.")
+                    break
+                if new_records >= self.prof["max_new_records"]:
+                    self.log("Límite de registros nuevos alcanzado.")
+                    break
+
+                _negscore, depth, url, from_url = heappop(heap)
+                if url in seen:
+                    continue
+                if depth > self.prof["max_depth"]:
+                    continue
+                dom = self._domain(url)
+                if per_domain_count[dom] >= self.prof["per_domain"]:
+                    continue
+
+                seen.add(url)
+                per_domain_count[dom] += 1
+                pages += 1
                 self.log(f"[{pages}] GET {url}")
-                try: status, html = self._fetch(url, s)
-                except Exception as e: self.log(f"ERR {url}: {e}"); continue
-                if status!=200 or not html: continue
+
+                status, html = self._fetch(url, s)
+                if status == 304 or not html:
+                    continue
+                if not (200 <= status < 300):
+                    self.log(f"HTTP {status} {url}")
+                    continue
+
                 try:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(html, "lxml")
+                    recs = self._extract_records(url, html)
                 except Exception as e:
-                    self.log(f"ERR parse HTML {url}: {e}"); continue
-                recs = self._extract_records(url, html)
+                    self.log(f"ERR parse HTML {url}: {e}")
+                    recs = []
+
                 for r in recs:
                     d = r.get("fecha") or date.today()
                     tipo, fondo = r.get("tipo","Pago"), r.get("fondo","—")
                     detalle = (r.get("detalle") or "").strip() or "Publicación relacionada con pagos"
                     self.db.add(d, tipo=tipo, fondo=fondo, detalle=detalle, fuente=r.get("fuente",""), origen="web")
-                for a in soup.find_all("a", href=True):
-                    href = a.get("href",""); u2 = self._normalize_url(url, href)
-                    if not self._allowed(u2): continue
-                    t = strip_accents_lower((a.get_text(' ') or '') + ' ' + href)
-                    if any(k in t for k in self.KEYWORDS) and u2 not in seen:
-                        q.append((u2, depth+1))
+                    new_records += 1
+                    if new_records >= self.prof["max_new_records"]:
+                        break
+                if new_records >= self.prof["max_new_records"]:
+                    self.log("Cupo de registros alcanzado.")
+                    break
+
+                try:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, "lxml")
+                    for a in soup.find_all("a", href=True):
+                        href_raw = a.get("href","")
+                        href = self._normalize_url(url, href_raw)
+                        if not self._allowed(href) or href in seen:
+                            continue
+                        if any(href.lower().endswith(ext) for ext in self.DOC_EXTS):
+                            continue
+                        if not any(href.lower().endswith(ext) for ext in self.HTML_EXTS):
+                            continue
+                        score = self._score_link(a.get_text(" "), href, url)
+                        if score <= 0:
+                            continue
+                        heappush(heap, (-score, depth+1, href, url))
+                except Exception as e:
+                    self.log(f"ERR links {url}: {e}")
+                    continue
+
         return pages
 
-# -------------------- App principal --------------------
 class App(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
@@ -1202,6 +1349,13 @@ class App(tk.Frame):
         win.grab_set(); win.focus_force()
 
         tk.Label(win, text="Crawling masivo (dominios oficiales):", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+        frm_opts = tk.Frame(win); frm_opts.pack(fill="x", padx=10, pady=(0,4))
+        tk.Label(frm_opts, text="Modo:").pack(side="left")
+        mode_var = tk.StringVar(value="Rápido")
+        ttk.Combobox(frm_opts, textvariable=mode_var, state="readonly",
+                     values=("Rápido","Normal","Profundo"), width=10).pack(side="left", padx=(4,12))
+        tk.Label(frm_opts, text="(últimos 6 meses)").pack(side="left")
+
         txt_log = tk.Text(win, height=14); txt_log.pack(fill="both", expand=True, padx=10, pady=6)
         bar = ttk.Progressbar(win, mode="indeterminate"); bar.pack(fill="x", padx=10, pady=(0, 10))
         btns = tk.Frame(win); btns.pack(fill="x", padx=10, pady=(0, 10))
@@ -1214,6 +1368,59 @@ class App(tk.Frame):
         btn_cancel.pack(side="right")
 
         bar.start(10)
+
+        def log(*a):
+            s = " ".join(str(x) for x in a) + "\n"
+            self.after(0, lambda: (txt_log.insert("end", s), txt_log.see("end")))
+
+        def finish():
+            try:
+                bar.stop()
+                btn_cancel.config(state="disabled")
+                btn_close.config(state="normal")
+            except Exception:
+                pass
+
+        def run_task():
+            try:
+                missing = []
+                try:
+                    import requests  # noqa
+                except Exception:
+                    missing.append("requests")
+                try:
+                    import bs4  # beautifulsoup4
+                except Exception:
+                    missing.append("beautifulsoup4")
+                try:
+                    import lxml  # noqa
+                except Exception:
+                    missing.append("lxml")
+                if missing:
+                    msg = ("Faltan dependencias: " + ", ".join(missing) + "\nInstala: pip install " + " ".join(missing))
+                    log(msg)
+                    try: self.console.show("error", msg)
+                    except Exception: pass
+                    finish(); return
+
+                mode = (mode_var.get() or "Rápido").lower()
+                crawler = SuperCrawler(self.db, mode=mode, since_months=6, log=log, stop_flag=lambda: stop_flag["stop"])
+                n = crawler.run()
+                log(f"Completado. Páginas visitadas: {n}.")
+                try: self._refresh_views()
+                except Exception: pass
+            except Exception as ex:
+                _err = str(ex)
+                log(f"ERROR: {_err}")
+                try: self.console.show("error", f"Error durante la actualización: {_err}")
+                except Exception: pass
+            finally:
+                finish()
+
+        import threading
+        threading.Thread(target=run_task, daemon=True).start()
+
+
 
         def log(*a):
             s = " ".join(str(x) for x in a) + "\n"
