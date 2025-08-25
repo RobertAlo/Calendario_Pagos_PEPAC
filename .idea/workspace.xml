@@ -4,7 +4,11 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="24d1cc2a-d654-42cd-843c-0221803a745d" name="Changes" comment="(v4.2.0 estable VERSION)" />
+    <list default="true" id="24d1cc2a-d654-42cd-843c-0221803a745d" name="Changes" comment="(v4.2.0 estable VERSION_beta)">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/Calendario.py" beforeDir="false" afterPath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/Calendario.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/pagos_pepac.sqlite3" beforeDir="false" afterPath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/pagos_pepac.sqlite3" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -13,22 +17,23 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 3
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 3
+}</component>
   <component name="ProjectId" id="31dmvpfXSpaxXdknbCPs4fVmA3t" />
   <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "RunOnceActivity.OpenProjectViewOnStart": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "last_opened_file_path": "C:/Users/ralonso/OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/Calendario_Pagos_PEPAC-master"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/ralonso/OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/DOCUMENTACIÓN FUNCIONAL/Calendario_Pagos_PEPAC-master&quot;
   }
-}]]></component>
+}</component>
   <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
   <component name="TaskManager">
     <task active="true" id="Default" summary="Default task">
@@ -54,7 +59,31 @@
       <option name="project" value="LOCAL" />
       <updated>1755862795844</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="(v4.2.0 estable VERSION_def)">
+      <option name="closed" value="true" />
+      <created>1755863133365</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1755863133365</updated>
+    </task>
+    <task id="LOCAL-00004" summary="(v4.2.0 estable VERSION_def)">
+      <option name="closed" value="true" />
+      <created>1755863308901</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1755863308901</updated>
+    </task>
+    <task id="LOCAL-00005" summary="(v4.2.0 estable VERSION_beta)">
+      <option name="closed" value="true" />
+      <created>1755863328957</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1755863328957</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="UpdateCopyrightCheckinHandler">
@@ -75,6 +104,8 @@
     <option name="CHECK_NEW_TODO" value="false" />
     <MESSAGE value="(v4.2.0 estable)" />
     <MESSAGE value="(v4.2.0 estable VERSION)" />
-    <option name="LAST_COMMIT_MESSAGE" value="(v4.2.0 estable VERSION)" />
+    <MESSAGE value="(v4.2.0 estable VERSION_def)" />
+    <MESSAGE value="(v4.2.0 estable VERSION_beta)" />
+    <option name="LAST_COMMIT_MESSAGE" value="(v4.2.0 estable VERSION_beta)" />
   </component>
 </project>

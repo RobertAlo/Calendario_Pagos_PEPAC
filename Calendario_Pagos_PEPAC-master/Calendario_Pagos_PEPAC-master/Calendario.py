@@ -860,7 +860,7 @@ class HelpCenterDialog(tk.Toplevel):
         self._open("Barra superior (botones principales)")
 
     def _build_topics(self) -> dict[str,str]:
-        v = "v4.1.0"
+        v = "v4.2.0"
         return {
             "Barra superior (botones principales)":
             f"""• Pagos de hoy → muestra el día actual en el panel de pagos.
@@ -1067,7 +1067,7 @@ class App(tk.Frame):
         self.pack(fill="both",expand=True)
 
         title=tk.Frame(self,bg="#f0f7ff")
-        tk.Label(title,text="Calendario FEAGA / FEADER – v4.1.0",
+        tk.Label(title,text="Calendario FEAGA / FEADER – v4.2.0",
                  bg="#f0f7ff",fg="#053e7b",font=("Segoe UI",13,"bold")).pack(side="left",padx=10,pady=8)
         title.pack(fill="x")
 
@@ -1077,7 +1077,9 @@ class App(tk.Frame):
         top=tk.Frame(self,bg="#eef5ff",highlightbackground="#cddcfb",highlightthickness=1)
 
         # Botones principales (guardamos referencia para tooltips)
-        self.btn_hoy = self._color_btn(top,"Pagos de hoy","#2e7d32", lambda: self._show_day(date.today()))
+        # en _build_ui
+        self.btn_hoy = self._color_btn(top, "Resumen de hoy", "#2e7d32", self._show_today_summary)
+
         self.btn_hoy.pack(side="left", padx=(8,4), pady=6)
 
         self.btn_hitos = self._color_btn(top,"Hitos del mes (visual)","#0d6efd", self._show_month_visual_of_selected)
@@ -1123,7 +1125,7 @@ class App(tk.Frame):
         top.pack(fill="x")
 
         # Tooltips
-        ToolTip(self.btn_hoy, "Ir al día de hoy.")
+        ToolTip(self.btn_hoy, "Resumen Manual+Web de hoy. Si no hay datos, muestra referencia FEAGA/FEADER.")
         ToolTip(self.btn_hitos, "Vista mensual visual con panel de detalle y exportación CSV.")
         ToolTip(self.btn_listado, "Listar todas las filas del mes seleccionado.")
         ToolTip(self.btn_rango, "Buscar por rango de fechas (dd/mm/aaaa).")
@@ -1146,6 +1148,7 @@ class App(tk.Frame):
         self.pay_frame=PaymentsInfoFrame(v_split)
         cal_holder=ttk.Frame(v_split)
         v_split.add(cal_holder,weight=3); v_split.add(self.pay_frame,weight=2)
+        self.cal_holder = cal_holder
 
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(0,4))
         self.btn_actualizar = self._color_btn(tools,"Actualizar pagos (web)","#ff8f00", self._update_from_web)
@@ -1156,22 +1159,15 @@ class App(tk.Frame):
         ToolTip(self.btn_actualizar, "Consultar FEGA y otras fuentes (requiere 'requests').")
         ToolTip(self.btn_importar, "Importar Excel/CSV (genérico o plantilla Aragón).")
 
-        def has_ev(y,m,d):
-            dt=date(y,m,d)
-            if self.db.has_day(dt): return True
-            return bool(FeagaRef.day_in_any_window(dt))
-
-        self.yearcal=YearCalendarFrame(
-            cal_holder, year=date.today().year,
-            on_day_click=lambda dt,**kw: (self._show_month(dt.year,dt.month) if kw.get("force_month") else self._show_day(dt)),
-            on_day_context=self._on_day_context,
-            has_events_predicate=has_ev
-        )
-        self.yearcal.pack(fill="both",expand=True)
-
-        tab_idx=ttk.Frame(self.tabs); self.tabs.add(tab_idx,text="Índice")
-        self._build_index_tab(tab_idx)
-
+    def _show_today_summary(self):
+        dt = date.today()
+        rows = self.db.get_day(dt, origins={"manual", "web"})  # solo Manual+Web
+        if not rows:
+            # cae a referencias si no hay datos “reales”
+            rows = FeagaRef.day_in_any_window(dt)
+            self.console.show("info", "Hoy no hay filas Manual/Web. Mostrando referencia FEAGA/FEADER.")
+        self.yearcal.go_to_date(dt)
+        self.pay_frame.show_rows(f"Hoy — {fmt_dmy(dt)}", rows)
     # ---------- Parpadeo del botón Limpiar panel ----------
     def _blink_clear_button(self, cycles:int=6, interval:int=180):
         if self._blink_job:
@@ -1677,7 +1673,7 @@ class App(tk.Frame):
 
     # ---- Auto-carga al arrancar (silenciosa, 1 vez por año) ----
     def _maybe_autoload_aragon_excel(self):
-        year = self.yearcal.current_year
+        year = getattr(getattr(self, 'yearcal', None), 'current_year', date.today().year)
         key = f"autoload_aragon_{year}"
         if self.db.get_meta(key): return  # ya importado para este año
 
@@ -1745,9 +1741,26 @@ class App(tk.Frame):
         self.console.show("warn","Buscando pagos/ventanas en FEGA (PDF, noticias) y fuentes extra…")
 
 # -------------------- main --------------------
+        # --- Safety: ensure calendar & index exist ---
+        if not hasattr(self, "yearcal"):
+            def has_ev(y, m, d):
+                dt = date(y, m, d)
+                if self.db.has_day(dt): return True
+                return bool(FeagaRef.day_in_any_window(dt))
+            self.yearcal = YearCalendarFrame(
+                self.cal_holder, year=date.today().year,
+                on_day_click=lambda dt, **kw: (self._show_month(dt.year, dt.month) if kw.get("force_month") else self._show_day(dt)),
+                on_day_context=self._on_day_context,
+                has_events_predicate=has_ev
+            )
+            self.yearcal.pack(fill="both", expand=True)
+            tab_idx = ttk.Frame(self.tabs)
+            self.tabs.add(tab_idx, text="Índice")
+            self._build_index_tab(tab_idx)
+
 def main():
     root=tk.Tk()
-    root.title("Calendario FEAGA/FEADER – v4.1.0")
+    root.title("Calendario FEAGA/FEADER – v4.2.0")
     root.geometry("1280x820")
     try:
         from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
