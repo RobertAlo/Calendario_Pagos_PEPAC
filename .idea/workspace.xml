@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="24d1cc2a-d654-42cd-843c-0221803a745d" name="Changes" comment="(v4.2.1 estable VERSION_beta)">
+    <list default="true" id="24d1cc2a-d654-42cd-843c-0221803a745d" name="Changes" comment="(v4.2.2 estable VERSION_beta)">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/Calendario.py" beforeDir="false" afterPath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/Calendario.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/pagos_pepac.sqlite3" beforeDir="false" afterPath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/pagos_pepac.sqlite3" afterDir="false" />
@@ -96,7 +96,15 @@
       <option name="project" value="LOCAL" />
       <updated>1756111205538</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="(v4.2.2 estable VERSION_beta)">
+      <option name="closed" value="true" />
+      <created>1756113287966</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1756113287966</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="UpdateCopyrightCheckinHandler">
@@ -120,6 +128,7 @@
     <MESSAGE value="(v4.2.0 estable VERSION_def)" />
     <MESSAGE value="(v4.2.0 estable VERSION_beta)" />
     <MESSAGE value="(v4.2.1 estable VERSION_beta)" />
-    <option name="LAST_COMMIT_MESSAGE" value="(v4.2.1 estable VERSION_beta)" />
+    <MESSAGE value="(v4.2.2 estable VERSION_beta)" />
+    <option name="LAST_COMMIT_MESSAGE" value="(v4.2.2 estable VERSION_beta)" />
   </component>
 </project>
