@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Calendario FEAGA/FEADER – v4.2.0
+Calendario FEAGA/FEADER – [v4.2.0 estable VERSION]_BETA
 
 Novedades en esta versión:
 - Hitos del mes (visual): ventana normal con botones de minimizar/maximizar/cerrar, redimensionable.
   Incluye panel de DETALLE a la derecha: clic en un día => lista completa del día (sin recortes).
   Doble clic en un día => salta al listado principal (como antes).
-- Actualizar pagos (web): muestra ventana emergente con las FUENTES consultadas y resumen final.
+- Actualizar pagos: muestra ventana emergente con las FUENTES consultadas y resumen final.
 - Resto de funcionalidad se mantiene. Auto-carga de Excel de Aragón incluida (1 vez por año).
 - NUEVO: Centro de Ayuda (¿? y tecla F1) + tooltips en botones.
 
@@ -89,6 +89,16 @@ class PaymentsDB:
                     v TEXT
                 )
             """)
+            
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS crawl_cache(
+                    url TEXT PRIMARY KEY,
+                    etag TEXT, last_modified TEXT,
+                    status INTEGER,
+                    fetched_at TEXT,
+                    content_hash TEXT
+                )
+            """)
             self.conn.commit()
 
     # ---- metadatos ----
@@ -161,7 +171,20 @@ class PaymentsDB:
             rows=self.conn.execute(q,args).fetchall()
             return [dict(r) for r in rows]
 
-    def has_day(self, d: date) -> bool:
+    
+    def search(self, d1: date, d2: date, fondo: str | None = None, origins: set[str] | None = None) -> list[dict]:
+        """Devuelve filas entre d1 y d2 con filtros opcionales; ordenadas por fecha y origen (desc)."""
+        with self._lock:
+            q = "SELECT * FROM pagos WHERE date(fecha) BETWEEN date(?) AND date(?)"
+            args = [iso(d1), iso(d2)]
+            if fondo:
+                q += " AND fondo = ?"; args.append(fondo)
+            if origins:
+                q += f" AND origen IN ({','.join('?'*len(origins))})"; args += list(origins)
+            q += " ORDER BY fecha, origen DESC, tipo"
+            rows = self.conn.execute(q, args).fetchall()
+            return [dict(r) for r in rows]
+def has_day(self, d: date) -> bool:
         with self._lock:
             r=self.conn.execute("SELECT 1 FROM pagos WHERE fecha=? LIMIT 1",(iso(d),)).fetchone()
         return bool(r)
@@ -906,7 +929,7 @@ class HelpCenterDialog(tk.Toplevel):
 • Leyenda inferior de colores.
 """,
 
-            "Actualizar pagos (web)":
+            "Actualizar pagos":
             """• Abre una ventana de “Fuentes consultadas”.
 • Descarga desde:
     – Notas FEGA (PDF) para anticipo/saldo.
@@ -1028,7 +1051,231 @@ class PaymentsInfoFrame(ttk.Frame):
             self.tree.insert("", "end", values=vals, tags=(r.get("origen",""),))
         self.update_idletasks()
 
-# -------------------- App principal --------------------
+# -------------------- SuperCrawler (scraping masivo) --------------------
+
+# -------------------- SuperCrawler (con modos y TTL) --------------------
+class SuperCrawler:
+    DEFAULT_SEEDS = [
+        "https://www.fega.gob.es/es",
+        "https://www.fega.gob.es/es/noticias",
+        "https://www.fega.gob.es/sites/default/files/files",
+    ]
+    ALLOWED_DOMAINS = [
+        "fega.gob.es","boe.es","boa.aragon.es","aragon.es",
+        "navarra.es","juntadeandalucia.es","castillayleon.es","gencat.cat","juntaex.es","gobcan.es"
+    ]
+    KEYWORDS = ["pago","pagos","feaga","feader","anticipo","anticipos","saldo","saldos",
+                "ecorr","eerr","ayudas","resolucion","resolución","orden","calendario"]
+    DOC_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".csv")
+    HTML_EXTS = (".html",".htm","")  # sin extensión o html
+
+    MODE_PROFILES = {
+        "rapido":   dict(max_pages=40,  max_depth=2, per_domain=25,  ttl_hours=24,  time_budget=60,  max_new_records=40),
+        "normal":   dict(max_pages=120, max_depth=3, per_domain=80,  ttl_hours=72,  time_budget=120, max_new_records=120),
+        "profundo": dict(max_pages=300, max_depth=4, per_domain=120, ttl_hours=168, time_budget=240, max_new_records=300),
+    }
+
+    MES = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,
+           "agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
+
+    def __init__(self, db, seeds=None, mode="rapido", log=lambda *_: None, stop_flag=lambda: False,
+                 since_months=6, **overrides):
+        self.db = db
+        self.seeds = list(seeds or self.DEFAULT_SEEDS)
+        prof = dict(self.MODE_PROFILES.get(str(mode).lower(), self.MODE_PROFILES["rapido"]))
+        prof.update(overrides or {})
+        self.prof = prof
+        self.log = log
+        self.stop_flag = stop_flag
+        self.since_date = self._months_ago(date.today(), since_months)
+
+    # ---------- utilidades ----------
+    def _months_ago(self, d, months):
+        y, m = d.year, d.month - int(months)
+        while m <= 0:
+            y -= 1
+            m += 12
+        return date(y, m, 1)
+
+    def _domain(self, url):
+        from urllib.parse import urlparse
+        return urlparse(url).netloc.lower()
+
+    def _normalize_url(self, base, href):
+        from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+        u = urljoin(base, href)
+        pr = urlparse(u)
+        q = [(k,v) for (k,v) in parse_qsl(pr.query) if not k.lower().startswith(("utm_","gclid","fbclid"))]
+        pr = pr._replace(query=urlencode(q, doseq=True), fragment="")
+        return urlunparse(pr)
+
+    def _allowed(self, url):
+        d = self._domain(url)
+        return any(d.endswith(ad) for ad in self.ALLOWED_DOMAINS)
+
+    # ---------- caché/TTL + condicionales ----------
+    def _should_skip_by_ttl(self, url):
+        ttl_h = self.prof["ttl_hours"]
+        with self.db._lock:
+            r = self.db.conn.execute("SELECT fetched_at FROM crawl_cache WHERE url=?", (url,)).fetchone()
+        if not r:
+            return False
+        try:
+            from datetime import datetime
+            fetched = datetime.strptime(r["fetched_at"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return False
+        delta_h = (datetime.utcnow() - fetched).total_seconds() / 3600.0
+        return delta_h < ttl_h
+
+    def _fetch(self, url, session):
+        if self._should_skip_by_ttl(url):
+            return 304, ""
+        headers = {"User-Agent":"Calendario-PEPAC/1.0 (crawler educativo)"}
+        etag = last_mod = None
+        with self.db._lock:
+            r = self.db.conn.execute("SELECT etag,last_modified FROM crawl_cache WHERE url=?", (url,)).fetchone()
+        if r:
+            etag = r["etag"] or None
+            last_mod = r["last_modified"] or None
+        if etag: headers["If-None-Match"] = etag
+        if last_mod: headers["If-Modified-Since"] = last_mod
+        try:
+            r = session.get(url, timeout=15, headers=headers, allow_redirects=True)
+        except Exception as e:
+            self.log(f"ERR GET {url}: {e}"); return 0, ""
+        status = r.status_code
+        text = r.text if (200 <= status < 300) else ""
+        new_etag = r.headers.get("ETag",""); lm = r.headers.get("Last-Modified","")
+        try:
+            import hashlib
+            h = hashlib.sha256((text or "").encode("utf-8", "ignore")).hexdigest() if text else ""
+        except Exception:
+            h = ""
+        with self.db._lock:
+            self.db.conn.execute(
+                "INSERT OR REPLACE INTO crawl_cache(url,etag,last_modified,status,fetched_at,content_hash) "
+                "VALUES (?,?,?,?,datetime('now'),?)",
+                (url, new_etag, lm, status, h)
+            ); self.db.conn.commit()
+        return status, text
+
+    # ---------- extracción y scoring ----------
+    def _parse_date_text(self, t):
+        import re as _re
+        t = strip_accents_lower(t)
+        m = _re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", t)
+        if m:
+            try: return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            except Exception: pass
+        m = _re.search(r"(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})", t)
+        if m and m.group(2) in self.MES:
+            try: return date(int(m.group(3)), self.MES[m.group(2)], int(m.group(1)))
+            except Exception: pass
+        return None
+
+    def _classify(self, txt):
+        t = strip_accents_lower(txt)
+        fondo = "FEADER" if ("feader" in t or "desarrollo rural" in t) else ("FEAGA" if "feaga" in t else "—")
+        tipo = "Anticipo" if ("anticipo" in t or "anticipos" in t) else ("Saldo" if ("saldo" in t or "saldos" in t) else "Pago")
+        return tipo, fondo
+
+    def _score_link(self, label, href, base_url):
+        t = strip_accents_lower((label or "") + " " + (href or ""))
+        score = 0
+        for kw in self.KEYWORDS:
+            if kw in t: score += 3
+        if "/sites/default/files" in href: score += 5
+        if any(href.lower().endswith(ext) for ext in self.DOC_EXTS): score += 4
+        if self._domain(href) == self._domain(base_url): score += 1
+        return score
+
+    def _extract_records(self, base_url, html):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        out = []
+        for a in soup.find_all("a", href=True):
+            href = self._normalize_url(base_url, a.get("href",""))
+            label = " ".join(a.get_text(" ").split()) or href
+            if not self._allowed(href): 
+                continue
+            if any(href.lower().endswith(ext) for ext in self.DOC_EXTS):
+                d = self._parse_date_text(label) or self._parse_date_text(href)
+                if d and d < self.since_date:
+                    continue
+                tipo, fondo = self._classify(label)
+                out.append({"url": href, "fecha": d or date.today(), "tipo": tipo,
+                            "fondo": fondo, "detalle": label, "fuente": href})
+        return out
+
+    # ---------- ejecución ----------
+    def run(self):
+        import time
+        from heapq import heappush, heappop
+        from collections import defaultdict
+        import requests
+        start_ts = time.time()
+        seen = set(); per_domain_count = defaultdict(int)
+        pages = 0; new_records = 0
+
+        heap = []
+        for u in self.seeds:
+            if self._allowed(u):
+                heappush(heap, (-10, 0, u, u))  # (score, depth, url, from_url)
+
+        with requests.Session() as s:
+            while heap and not self.stop_flag():
+                if (time.time() - start_ts) > self.prof["time_budget"]:
+                    self.log("Tiempo máximo alcanzado."); break
+                if pages >= self.prof["max_pages"]:
+                    self.log("Límite de páginas alcanzado."); break
+                if new_records >= self.prof["max_new_records"]:
+                    self.log("Límite de registros nuevos alcanzado."); break
+
+                _neg, depth, url, _from = heappop(heap)
+                if url in seen: continue
+                if depth > self.prof["max_depth"]: continue
+                dom = self._domain(url)
+                if per_domain_count[dom] >= self.prof["per_domain"]: continue
+
+                seen.add(url); per_domain_count[dom] += 1; pages += 1
+                self.log(f"[{pages}] GET {url}")
+                status, html = self._fetch(url, s)
+                if status == 304 or not html: continue
+                if not (200 <= status < 300):
+                    self.log(f"HTTP {status} {url}"); continue
+
+                try: recs = self._extract_records(url, html)
+                except Exception as e:
+                    self.log(f"ERR parse HTML {url}: {e}"); recs = []
+
+                for r in recs:
+                    d = r.get("fecha") or date.today()
+                    tipo, fondo = r.get("tipo","Pago"), r.get("fondo","—")
+                    detalle = (r.get("detalle") or "").strip() or "Publicación relacionada con pagos"
+                    self.db.add(d, tipo=tipo, fondo=fondo, detalle=detalle, fuente=r.get("fuente",""), origen="web")
+                    new_records += 1
+                    if new_records >= self.prof["max_new_records"]:
+                        break
+                if new_records >= self.prof["max_new_records"]:
+                    self.log("Cupo de registros alcanzado."); break
+
+                try:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, "lxml")
+                    for a in soup.find_all("a", href=True):
+                        href = self._normalize_url(url, a.get("href",""))
+                        if not self._allowed(href) or href in seen: continue
+                        if any(href.lower().endswith(ext) for ext in self.DOC_EXTS): continue
+                        if not any(href.lower().endswith(ext) for ext in self.HTML_EXTS): continue
+                        score = self._score_link(a.get_text(" "), href, url)
+                        if score <= 0: continue
+                        heappush(heap, (-score, depth+1, href, url))
+                except Exception as e:
+                    self.log(f"ERR links {url}: {e}"); continue
+
+        return pages
+
 class App(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
@@ -1047,6 +1294,229 @@ class App(tk.Frame):
 
         self._show_day(date.today())
 
+    def _open_update_options(self):
+        # Diálogo previo para elegir opciones antes de rastrear
+        win = tk.Toplevel(self)
+        win.title("Actualizar pagos — opciones")
+        win.transient(self.winfo_toplevel())
+        win.lift(); win.attributes("-topmost", True)
+        self.after(250, lambda: win.attributes("-topmost", False))
+        try:
+            self.update_idletasks()
+            gx = max(0, self.winfo_rootx() + (self.winfo_width() // 2 - 220))
+            gy = max(0, self.winfo_rooty() + (self.winfo_height() // 2 - 80))
+            win.geometry(f"440x160+{gx}+{gy}")
+        except Exception:
+            win.geometry("440x160")
+        win.grab_set(); win.focus_force()
+
+        frm = tk.Frame(win); frm.pack(fill="both", expand=True, padx=12, pady=10)
+        tk.Label(frm, text="Modo:").grid(row=0, column=0, sticky="w")
+        mode_var = tk.StringVar(value="Rápido")
+        ttk.Combobox(frm, textvariable=mode_var, state="readonly",
+                     values=("Rápido","Normal","Profundo"), width=12).grid(row=0, column=1, sticky="w", padx=(6,0))
+
+        tk.Label(frm, text="Meses a rastrear:").grid(row=1, column=0, sticky="w", pady=(10,0))
+        months_var = tk.IntVar(value=6)
+        ttk.Spinbox(frm, from_=1, to=24, textvariable=months_var, width=6).grid(row=1, column=1, sticky="w", padx=(6,0), pady=(10,0))
+
+        # botones
+        btns = tk.Frame(win); btns.pack(fill="x", padx=12, pady=(6,8))
+        def aceptar():
+            mode = (mode_var.get() or "Rápido").lower()
+            try:
+                since_m = int(months_var.get())
+            except Exception:
+                since_m = 6
+            since_m = max(1, min(24, since_m))
+            win.grab_release(); win.destroy()
+            self._update_from_web_super(mode=mode, since_months=since_m)
+
+        ttk.Button(btns, text="Cancelar", command=lambda: (win.grab_release(), win.destroy())).pack(side="right")
+        ttk.Button(btns, text="Continuar", command=aceptar).pack(side="right", padx=(6,0))
+
+    def _update_from_web_super(self, mode="rapido", since_months=6):
+        # Ventana de progreso (solo log + barra); las opciones se eligen en el diálogo previo
+        win = tk.Toplevel(self)
+        win.title("Actualizar pagos")
+        win.geometry("640x360")
+        win.transient(self.winfo_toplevel())
+        win.lift(); win.attributes("-topmost", True)
+        self.after(300, lambda: win.attributes("-topmost", False))
+        try:
+            self.update_idletasks()
+            gx = max(0, self.winfo_rootx() + (self.winfo_width() // 2 - 320))
+            gy = max(0, self.winfo_rooty() + (self.winfo_height() // 2 - 180))
+            win.geometry(f"+{gx}+{gy}")
+        except Exception:
+            pass
+        win.grab_set(); win.focus_force()
+
+        tk.Label(win, text="Crawling masivo (dominios oficiales):", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+        txt_log = tk.Text(win, height=14); txt_log.pack(fill="both", expand=True, padx=10, pady=6)
+        bar = ttk.Progressbar(win, mode="indeterminate"); bar.pack(fill="x", padx=10, pady=(0, 10))
+        btns = tk.Frame(win); btns.pack(fill="x", padx=10, pady=(0, 10))
+
+        stop_flag = {"stop": False}
+        btn_close = ttk.Button(btns, text="Cerrar", command=lambda: (bar.stop(), win.grab_release(), win.destroy()))
+        btn_close.pack(side="right", padx=(6, 0))
+        btn_close.config(state="disabled")
+        btn_cancel = ttk.Button(btns, text="Cancelar", command=lambda: stop_flag.__setitem__("stop", True))
+        btn_cancel.pack(side="right")
+
+        bar.start(10)
+
+        def log(*a):
+            s = " ".join(str(x) for x in a) + "\n"
+            self.after(0, lambda: (txt_log.insert("end", s), txt_log.see("end")))
+
+        def finish():
+            try:
+                bar.stop()
+                btn_cancel.config(state="disabled")
+                btn_close.config(state="normal")
+            except Exception:
+                pass
+
+        def run_task():
+            try:
+                missing = []
+                try:
+                    import requests  # noqa
+                except Exception:
+                    missing.append("requests")
+                try:
+                    import bs4  # beautifulsoup4
+                except Exception:
+                    missing.append("beautifulsoup4")
+                try:
+                    import lxml  # noqa
+                except Exception:
+                    missing.append("lxml")
+                if missing:
+                    msg = ("Faltan dependencias: " + ", ".join(missing) + "\nInstala: pip install " + " ".join(missing))
+                    try: self.console.show("error", msg)
+                    except Exception: pass
+                    finish(); return
+
+                crawler = SuperCrawler(self.db, mode=(mode or "rapido"), since_months=since_months,
+                                       log=log, stop_flag=lambda: stop_flag["stop"])
+                n = crawler.run()
+                log(f"Completado. Páginas visitadas: {n}.")
+                try: self._refresh_views()
+                except Exception: pass
+            except Exception as ex:
+                _err = str(ex)
+                log(f"ERROR: {_err}")
+                try: self.console.show("error", f"Error durante la actualización: {_err}")
+                except Exception: pass
+            finally:
+                finish()
+
+        import threading
+        threading.Thread(target=run_task, daemon=True).start()
+
+
+
+        def log(*a):
+            s = " ".join(str(x) for x in a) + "\n"
+            self.after(0, lambda: (txt_log.insert("end", s), txt_log.see("end")))
+
+        def finish():
+            try:
+                bar.stop()
+                btn_cancel.config(state="disabled")
+                btn_close.config(state="normal")
+            except Exception:
+                pass
+
+        def run_task():
+            try:
+                missing = []
+                try:
+                    import requests  # noqa
+                except Exception:
+                    missing.append("requests")
+                try:
+                    import bs4  # beautifulsoup4
+                except Exception:
+                    missing.append("beautifulsoup4")
+                try:
+                    import lxml  # noqa
+                except Exception:
+                    missing.append("lxml")
+                if missing:
+                    msg = ("Faltan dependencias: " + ", ".join(missing) +
+                           "\nInstala: pip install " + " ".join(missing))
+                    log(msg)
+                    try: self.console.show("error", msg)
+                    except Exception: pass
+                    finish(); return
+
+                crawler = SuperCrawler(self.db, seeds=None, max_pages=300, max_depth=3,
+                                       per_domain=80, log=log, stop_flag=lambda: stop_flag["stop"])
+                n = crawler.run()
+                log(f"Completado. Páginas visitadas: {n}.")
+                try: self._refresh_views()
+                except Exception: pass
+            except Exception as ex:
+                _err = str(ex)
+                log(f"ERROR: {_err}")
+                try: self.console.show("error", f"Error durante la actualización: {_err}")
+                except Exception: pass
+            finally:
+                finish()
+
+        import threading
+        threading.Thread(target=run_task, daemon=True).start()
+
+
+    def _refresh_views(self):
+        try:
+            if getattr(self, "_current_dt", None): self._show_day(self._current_dt)
+            else: self._show_day(date.today())
+        except Exception:
+            try: self._show_day(date.today())
+            except Exception: pass
+        try: self.yearcal.redraw()
+        except Exception: pass
+
+    def _show_today_summary(self):
+        dt = date.today()
+
+        # Mover el calendario a hoy (si existe)
+        try:
+            self.yearcal.go_to_date(dt)
+        except Exception:
+            pass
+
+        # Filtrar según los checks activos (si existen): Manual, Web, Referencia FEAGA, Información
+        origins = set()
+        try:
+            if self.chk_manual_var.get(): origins.add("manual")
+            if self.chk_web_var.get(): origins.add("web")
+            if self.chk_ref_var.get(): origins.add("heuristica")  # o "referencia" según tu BD
+            if self.chk_info_var.get(): origins.add("info")
+        except Exception:
+            # Si no existen los checks, usar Manual+Web por defecto
+            origins = {"manual", "web"}
+
+        # Traer pagos del día
+        try:
+            rows = self.db.get_day(dt, origins=origins) if origins else self.db.get_day(dt)
+        except TypeError:
+            # Por si tu get_day no acepta origins en esa versión
+            rows = self.db.get_day(dt)
+
+        # Fallback: referencias FEAGA/FEADER si no hay nada
+        if not rows:
+            rows = FeagaRef.day_in_any_window(dt)
+            if rows:
+                self.console.show("info", "Hoy no hay filas Manual/Web. Mostrando referencia FEAGA/FEADER.")
+
+        # Pintar
+        self.pay_frame.show_rows(f"Hoy — {fmt_dmy(dt)}", rows)
+
     def _setup_styles(self):
         st=ttk.Style()
         try:
@@ -1056,8 +1526,7 @@ class App(tk.Frame):
         st.configure("Pane.TFrame", background="#fafafa")
         st.configure("Colored.Treeview", rowheight=22)
 
-    @staticmethod
-    def _color_btn(parent, text, bg, command):
+    def _color_btn(self, parent, text, bg, command):
         btn=tk.Button(parent,text=text,bg=bg,fg="white",activebackground=bg,
                       relief="raised",bd=1,highlightthickness=0,command=command)
         btn.configure(font=("Segoe UI",9,"bold"), padx=10, pady=4, cursor="hand2")
@@ -1077,7 +1546,9 @@ class App(tk.Frame):
         top=tk.Frame(self,bg="#eef5ff",highlightbackground="#cddcfb",highlightthickness=1)
 
         # Botones principales (guardamos referencia para tooltips)
-        self.btn_hoy = self._color_btn(top,"Pagos de hoy","#2e7d32", lambda: self._show_day(date.today()))
+        # en _build_ui
+        self.btn_hoy = self._color_btn(top, "Resumen de hoy", "#2e7d32", self._show_today_summary)
+
         self.btn_hoy.pack(side="left", padx=(8,4), pady=6)
 
         self.btn_hitos = self._color_btn(top,"Hitos del mes (visual)","#0d6efd", self._show_month_visual_of_selected)
@@ -1087,6 +1558,18 @@ class App(tk.Frame):
         self.btn_listado.pack(side="left", padx=6, pady=6)
 
         self.btn_rango = ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog)
+
+        # Consulta en lenguaje natural (ES)
+        self.nl_entry = ttk.Entry(top, width=36)
+        self.nl_entry.pack(side="left", padx=(12,4), pady=6)
+        self.nl_btn = self._color_btn(top, "Consulta (ES)", "#6a00ff", self._query_nl)
+        self.nl_btn.pack(side="left", padx=2, pady=6)
+        self.nl_entry.bind("<Return>", lambda e: self._query_nl())
+        try:
+            ToolTip(self.nl_entry, "Ejemplos: 'saldos FEADER de octubre 2025 en Aragón', 'anticipos FEAGA este mes', 'hoy FEADER'")
+            ToolTip(self.nl_btn, "Interpreta la consulta y muestra los pagos filtrados")
+        except Exception:
+            pass
         self.btn_rango.pack(side="left", padx=6, pady=6)
 
         self.btn_add = ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog)
@@ -1148,17 +1631,30 @@ class App(tk.Frame):
         v_split.add(cal_holder,weight=3); v_split.add(self.pay_frame,weight=2)
 
         tools=ttk.Frame(cal_holder); tools.pack(fill="x",pady=(0,4))
-        self.btn_actualizar = self._color_btn(tools,"Actualizar pagos (web)","#ff8f00", self._update_from_web)
+        self.btn_actualizar = self._color_btn(tools, "Actualizar pagos", "#d32f2f", self._open_update_options)
         self.btn_actualizar.pack(side="left", padx=2, pady=2)
         self.btn_importar = ttk.Button(tools,text="Importar Excel…",command=self._import_excel)
         self.btn_importar.pack(side="left", padx=8, pady=2)
-        ttk.Label(tools,text="(orígenes: Web/Manual; FEAGA=genérico, FEADER=según resoluciones)",foreground="#666").pack(side="left", padx=8)
-        ToolTip(self.btn_actualizar, "Consultar FEGA y otras fuentes (requiere 'requests').")
+        ttk.Label(tools, text="(orígenes: Web/Manual; FEAGA=genérico, FEADER=según resoluciones)", foreground="#666").pack(side="left", padx=8)
+        ToolTip(self.btn_actualizar, "Rastreo masivo (web oficial FEAGA/FEADER). Requiere: requests, beautifulsoup4, lxml.")
         ToolTip(self.btn_importar, "Importar Excel/CSV (genérico o plantilla Aragón).")
 
         def has_ev(y,m,d):
-            dt=date(y,m,d)
-            if self.db.has_day(dt): return True
+            dt = date(y, m, d)
+            try:
+                hd = getattr(self.db, "has_day", None)
+                if callable(hd):
+                    if hd(dt):
+                        return True
+                else:
+                    # Fallback: consulta directa
+                    with self.db._lock:
+                        r = self.db.conn.execute("SELECT 1 FROM pagos WHERE fecha=? LIMIT 1", (iso(dt),)).fetchone()
+                    if r:
+                        return True
+            except Exception:
+                # No bloquear el calendario por errores de BD
+                pass
             return bool(FeagaRef.day_in_any_window(dt))
 
         self.yearcal=YearCalendarFrame(
@@ -1723,28 +2219,103 @@ class App(tk.Frame):
 
         win = WebSourcesDialog(self, sources)
         win.mark_running()
+    def _query_nl(self):
+        q = (self.nl_entry.get() if hasattr(self, "nl_entry") else "").strip()
+        if not q:
+            self.console.show("warn", "Escribe una consulta, por ejemplo: 'saldos FEADER de octubre 2025 en Aragón'."); return
+        params = self._parse_es_query(q)
+        d1, d2 = params["d1"], params["d2"]
+        rows = self.db.search(d1, d2, fondo=params.get("fondo"), origins=params.get("origins"))
+        rows = self._filter_rows(rows, params.get("tipo_kw", []), params.get("terms", []))
+        total = len(rows)
+        title = f"Consulta: {q} — {fmt_dmy(d1)}–{fmt_dmy(d2)}"
+        if total == 0:
+            if d1 == d2: rows = FeagaRef.day_in_any_window(d1)
+            else: rows = FeagaRef.month_generic_for_day(d1)
+            self.console.show("info", "Sin resultados exactos; mostrando referencias FEAGA/FEADER del periodo.")
+        else:
+            self.console.show("ok", f"{total} resultado{'s' if total!=1 else ''}.")
+        try: self.yearcal.go_to_date(d1)
+        except Exception: pass
+        self.pay_frame.show_rows(title, rows)
 
-        def run():
-            try:
-                n0 = self.db.count_rows()
-                sc=MultiSourceScraper()
-                if not sc.available(): raise RuntimeError("Falta 'requests'.")
-                sc.fetch_into_db(self.db, year_hint=date.today().year)
-                n1 = self.db.count_rows()
-                added = max(0, n1-n0)
-                self.after(0, lambda:(self.yearcal.refresh(),
-                                      self._refresh_current_view(),
-                                      self._refresh_index_tab(),
-                                      win.mark_done(added),
-                                      self.console.show("ok","Pagos actualizados desde múltiples fuentes web.")))
-            except Exception as ex:
-                self.after(0, lambda: (win.mark_done(0),
-                                       self.console.show("error", f"No se pudo completar la descarga: {ex}"),
-                                       messagebox.showerror("Web", f"No se pudo completar la descarga:\n{ex}")))
-        threading.Thread(target=run,daemon=True).start()
-        self.console.show("warn","Buscando pagos/ventanas en FEGA (PDF, noticias) y fuentes extra…")
+    def _filter_rows(self, rows: list[dict], tipo_kw: list[str], terms: list[str]) -> list[dict]:
+        def norm(s): return strip_accents_lower(s or "")
+        kw = [norm(k) for k in (tipo_kw or [])]
+        ts = [norm(t) for t in (terms or [])]
+        out = []
+        for r in rows:
+            tipo_n = norm(r.get("tipo","")); detalle_n = norm(r.get("detalle","")); fuente_n = norm(r.get("fuente",""))
+            ok_tipo = all(k in tipo_n for k in kw) if kw else True
+            ok_terms = all((t in detalle_n) or (t in tipo_n) or (t in fuente_n) for t in ts) if ts else True
+            if ok_tipo and ok_terms: out.append(r)
+        return out
 
-# -------------------- main --------------------
+    def _parse_es_query(self, q: str) -> dict:
+        import re as _re
+        t_raw = q.strip(); t = strip_accents_lower(t_raw); today = date.today()
+
+        d1 = today.replace(day=1); d2 = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+        fondo = None; origins = None; tipo_kw = []; terms = []
+
+        if "feader" in t: fondo = "FEADER"
+        elif "feaga" in t: fondo = "FEAGA"
+
+        if " web" in f" {t} " or " de web" in t: origins = {"web"}
+        if " manual" in f" {t} " or " a mano" in t or " manuales" in t: origins = {"manual"}
+        if " heur" in t or "referencia" in t or " info" in f" {t} ": origins = {"heuristica","info"}
+
+        if "anticipo" in t or "anticipos" in t: tipo_kw.append("anticipo")
+        if "saldo" in t or "saldos" in t: tipo_kw.append("saldo")
+
+        meses = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
+
+        def set_month(y, m): return date(y,m,1), date(y,m,calendar.monthrange(y,m)[1])
+        def month_shift(d, delta):
+            y = d.year; m = d.month + delta
+            while m<1: m+=12; y-=1
+            while m>12: m-=12; y+=1
+            return set_month(y, m)
+
+        m = _re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4}).{0,10}(\d{1,2})[/-](\d{1,2})[/-](\d{4})", t)
+        if m:
+            d1 = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            d2 = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+        else:
+            m = _re.search(r"del\s+(\d{1,2})\s+al\s+(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?", t)
+            if m and m.group(3) in meses:
+                y = int(m.group(4)) if m.group(4) else today.year
+                mnum = meses[m.group(3)]; d1 = date(y, mnum, int(m.group(1))); d2 = date(y, mnum, int(m.group(2)))
+            else:
+                m2 = _re.search(r"(?:en|de)\s+([a-z]+)(?:\s+de\s+(\d{4}))?", t)
+                if m2 and m2.group(1) in meses:
+                    y = int(m2.group(2)) if m2.group(2) else today.year
+                    d1, d2 = set_month(y, meses[m2.group(1)])
+                else:
+                    if "hoy" in t: d1=d2=today
+                    elif "manana" in t: d1=d2=today+timedelta(days=1)
+                    elif "ayer" in t: d1=d2=today-timedelta(days=1)
+                    elif "este mes" in t or "en este mes" in t: d1,d2=set_month(today.year, today.month)
+                    elif "proximo mes" in t or "siguiente mes" in t: d1,d2=month_shift(today,1)
+                    elif "mes pasado" in t or "mes anterior" in t: d1,d2=month_shift(today,-1)
+                    elif "esta semana" in t or "semana actual" in t:
+                        dow = today.weekday(); d1 = today - timedelta(days=dow); d2 = d1 + timedelta(days=6)
+                    elif "semana que viene" in t or "proxima semana" in t:
+                        dow = today.weekday(); d1 = today - timedelta(days=dow) + timedelta(days=7); d2 = d1 + timedelta(days=6)
+                    elif "semana pasada" in t:
+                        dow = today.weekday(); d2 = today - timedelta(days=dow) - timedelta(days=1); d1 = d2 - timedelta(days=6)
+                    else:
+                        m3 = _re.search(r"(?:en|de)\s+(\d{4})", t)
+                        if m3: y=int(m3.group(1)); d1=date(y,1,1); d2=date(y,12,31)
+
+        stop = {"ensename","muestrame","dime","consulta","ver","dame","los","las","de","del","en","la","el","por","para","sobre","desde","hasta","entre","al","a","y","o","con","sin","un","una","unos","unas","que","cuales","son"}
+        base_terms = [w for w in _re.findall(r"[a-z0-9]{3,}", t) if w not in stop]
+        excluir = {"feader","feaga","anticipo","anticipos","saldo","saldos","hoy","ayer","manana","aragon"} | set(meses.keys())
+        terms = [w for w in base_terms if w not in excluir]
+        if "aragon" in t: terms.append("aragon")
+
+        return {"d1": d1, "d2": d2, "fondo": fondo, "origins": origins, "tipo_kw": tipo_kw, "terms": terms}
+
 def main():
     root=tk.Tk()
     root.title("Calendario FEAGA/FEADER – v4.1.0")
