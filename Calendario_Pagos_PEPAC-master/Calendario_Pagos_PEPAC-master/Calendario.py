@@ -161,7 +161,21 @@ class PaymentsDB:
             rows=self.conn.execute(q,args).fetchall()
             return [dict(r) for r in rows]
 
-    def has_day(self, d: date) -> bool:
+    
+    def search(self, d1: date, d2: date, fondo: str | None = None, origins: set[str] | None = None) -> list[dict]:
+        """Devuelve filas entre d1 y d2 con filtros opcionales; ordenadas por fecha y origen (desc)."""
+        with self._lock:
+            q = "SELECT * FROM pagos WHERE date(fecha) BETWEEN date(?) AND date(?)"
+            args = [iso(d1), iso(d2)]
+            if fondo:
+                q += " AND fondo = ?"; args.append(fondo)
+            if origins:
+                q += f" AND origen IN ({','.join('?'*len(origins))})"; args += list(origins)
+            q += " ORDER BY fecha, origen DESC, tipo"
+            rows = self.conn.execute(q, args).fetchall()
+            return [dict(r) for r in rows]
+
+def has_day(self, d: date) -> bool:
         with self._lock:
             r=self.conn.execute("SELECT 1 FROM pagos WHERE fecha=? LIMIT 1",(iso(d),)).fetchone()
         return bool(r)
@@ -1091,6 +1105,18 @@ class App(tk.Frame):
         self.btn_rango = ttk.Button(top,text="Buscar rango…",command=self._show_range_dialog)
         self.btn_rango.pack(side="left", padx=6, pady=6)
 
+        # Consulta en lenguaje natural (ES)
+        self.nl_entry = ttk.Entry(top, width=36)
+        self.nl_entry.pack(side="left", padx=(12,4), pady=6)
+        self.nl_btn = self._color_btn(top, "Consulta (ES)", "#6a00ff", self._query_nl)
+        self.nl_btn.pack(side="left", padx=2, pady=6)
+        self.nl_entry.bind("<Return>", lambda e: self._query_nl())
+        try:
+            ToolTip(self.nl_entry, "Ejemplos: 'saldos FEADER de octubre 2025 en Aragón', 'anticipos FEAGA este mes', 'hoy FEADER'")
+            ToolTip(self.nl_btn, "Interpreta la consulta y muestra los pagos filtrados")
+        except Exception:
+            pass
+
         self.btn_add = ttk.Button(top,text="Añadir pago…",command=self._add_payment_dialog)
         self.btn_add.pack(side="left", padx=(12,4), pady=6)
 
@@ -1158,6 +1184,35 @@ class App(tk.Frame):
         ttk.Label(tools,text="(orígenes: Web/Manual; FEAGA=genérico, FEADER=según resoluciones)",foreground="#666").pack(side="left", padx=8)
         ToolTip(self.btn_actualizar, "Consultar FEGA y otras fuentes (requiere 'requests').")
         ToolTip(self.btn_importar, "Importar Excel/CSV (genérico o plantilla Aragón).")
+
+        # --- Calendario anual ---
+        def _has_ev(y, m, d):
+            dt = date(y, m, d)
+            try:
+                has = self.db.has_day(dt)  # método estándar
+            except AttributeError:
+                # Fallback: consulta directa a la BD por si el método no existe en esta copia
+                try:
+                    with self.db._lock:
+                        r = self.db.conn.execute("SELECT 1 FROM pagos WHERE fecha=? LIMIT 1", (iso(dt),)).fetchone()
+                    has = bool(r)
+                except Exception:
+                    has = False
+            return has or bool(FeagaRef.day_in_any_window(dt))
+
+        self.yearcal = YearCalendarFrame(
+            self.cal_holder, year=date.today().year,
+            on_day_click=lambda dt, **kw: (self._show_month(dt.year, dt.month) if kw.get("force_month") else self._show_day(dt)),
+            on_day_context=self._on_day_context,
+            has_events_predicate=_has_ev
+        )
+        self.yearcal.pack(fill="both", expand=True)
+
+        # Pestaña Índice
+        tab_idx = ttk.Frame(self.tabs)
+        self.tabs.add(tab_idx, text="Índice")
+        self._build_index_tab(tab_idx)
+
 
     def _show_today_summary(self):
         dt = date.today()
@@ -1741,22 +1796,134 @@ class App(tk.Frame):
         self.console.show("warn","Buscando pagos/ventanas en FEGA (PDF, noticias) y fuentes extra…")
 
 # -------------------- main --------------------
-        # --- Safety: ensure calendar & index exist ---
-        if not hasattr(self, "yearcal"):
-            def has_ev(y, m, d):
-                dt = date(y, m, d)
-                if self.db.has_day(dt): return True
-                return bool(FeagaRef.day_in_any_window(dt))
-            self.yearcal = YearCalendarFrame(
-                self.cal_holder, year=date.today().year,
-                on_day_click=lambda dt, **kw: (self._show_month(dt.year, dt.month) if kw.get("force_month") else self._show_day(dt)),
-                on_day_context=self._on_day_context,
-                has_events_predicate=has_ev
-            )
-            self.yearcal.pack(fill="both", expand=True)
-            tab_idx = ttk.Frame(self.tabs)
-            self.tabs.add(tab_idx, text="Índice")
-            self._build_index_tab(tab_idx)
+        
+
+
+    # -------------------- Consulta en Lenguaje Natural (ES) --------------------
+    def _query_nl(self):
+        q = (self.nl_entry.get() if hasattr(self, "nl_entry") else "").strip()
+        if not q:
+            self.console.show("warn", "Escribe una consulta, por ejemplo: 'saldos FEADER de octubre 2025 en Aragón'."); return
+        params = self._parse_es_query(q)
+        d1, d2 = params["d1"], params["d2"]
+        rows = self.db.search(d1, d2, fondo=params.get("fondo"), origins=params.get("origins"))
+        rows = self._filter_rows(rows, params.get("tipo_kw", []), params.get("terms", []))
+        total = len(rows)
+        title = f"Consulta: {q} — {fmt_dmy(d1)}–{fmt_dmy(d2)}"
+        # Fallbacks amigables
+        if total == 0:
+            if d1 == d2:
+                rows = FeagaRef.day_in_any_window(d1)
+            else:
+                rows = FeagaRef.month_generic_for_day(d1)
+            self.console.show("info", "Sin resultados exactos; mostrando referencias FEAGA/FEADER del periodo.")
+        else:
+            self.console.show("ok", f"{total} resultado{'s' if total!=1 else ''}.")
+        try:
+            self.yearcal.go_to_date(d1)
+        except Exception:
+            pass
+        self.pay_frame.show_rows(title, rows)
+
+    def _filter_rows(self, rows: list[dict], tipo_kw: list[str], terms: list[str]) -> list[dict]:
+        def norm(s): return strip_accents_lower(s or "")
+        kw = [norm(k) for k in (tipo_kw or [])]
+        ts = [norm(t) for t in (terms or [])]
+        out = []
+        for r in rows:
+            tipo_n = norm(r.get("tipo",""))
+            detalle_n = norm(r.get("detalle",""))
+            fuente_n = norm(r.get("fuente",""))
+            ok_tipo = all(k in tipo_n for k in kw) if kw else True
+            ok_terms = all((t in detalle_n) or (t in tipo_n) or (t in fuente_n) for t in ts) if ts else True
+            if ok_tipo and ok_terms: out.append(r)
+        return out
+
+    def _parse_es_query(self, q: str) -> dict:
+        import re as _re
+        t_raw = q.strip()
+        t = strip_accents_lower(t_raw)
+        today = date.today()
+
+        # Defaults: mes actual
+        d1 = today.replace(day=1)
+        d2 = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+        fondo = None; origins = None; tipo_kw = []; terms = []
+
+        # Fondo
+        if "feader" in t: fondo = "FEADER"
+        elif "feaga" in t: fondo = "FEAGA"
+
+        # Origen
+        if " web" in f" {t} " or " de web" in t: origins = {"web"}
+        if " manual" in f" {t} " or " a mano" in t or " manuales" in t: origins = {"manual"}
+        if " heur" in t or "referencia" in t or " info" in f" {t} ": origins = {"heuristica","info"}
+
+        # Tipo
+        if "anticipo" in t or "anticipos" in t: tipo_kw.append("anticipo")
+        if "saldo" in t or "saldos" in t: tipo_kw.append("saldo")
+
+        # Meses
+        meses = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,
+                 "octubre":10,"noviembre":11,"diciembre":12}
+
+        # Helpers
+        def set_month(y, m):
+            return date(y,m,1), date(y,m,calendar.monthrange(y,m)[1])
+
+        def month_shift(d, delta):
+            y = d.year; m = d.month + delta
+            while m<1: m+=12; y-=1
+            while m>12: m-=12; y+=1
+            return set_month(y, m)
+
+        # Rango dd/mm/yyyy a dd/mm/yyyy
+        m = _re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4}).{0,10}(\d{1,2})[/-](\d{1,2})[/-](\d{4})", t)
+        if m:
+            d1 = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            d2 = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+        else:
+            # 'del 15 al 20 de octubre de 2025'
+            m = _re.search(r"del\s+(\d{1,2})\s+al\s+(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?", t)
+            if m and m.group(3) in meses:
+                y = int(m.group(4)) if m.group(4) else today.year
+                mnum = meses[m.group(3)]
+                d1 = date(y, mnum, int(m.group(1))); d2 = date(y, mnum, int(m.group(2)))
+            else:
+                # Mes suelto 'octubre (2025?)'
+                m2 = _re.search(r"(?:en|de)\s+([a-z]+)(?:\s+de\s+(\d{4}))?", t)
+                if m2 and m2.group(1) in meses:
+                    y = int(m2.group(2)) if m2.group(2) else today.year
+                    d1, d2 = set_month(y, meses[m2.group(1)])
+                else:
+                    # Palabras de rango relativo
+                    if "hoy" in t: d1 = d2 = today
+                    elif "manana" in t: d1 = d2 = today + timedelta(days=1)
+                    elif "ayer" in t: d1 = d2 = today - timedelta(days=1)
+                    elif "este mes" in t or "en este mes" in t: d1, d2 = set_month(today.year, today.month)
+                    elif "proximo mes" in t or "siguiente mes" in t: d1, d2 = month_shift(today, 1)
+                    elif "mes pasado" in t or "mes anterior" in t: d1, d2 = month_shift(today, -1)
+                    elif "esta semana" in t or "semana actual" in t:
+                        dow = today.weekday()
+                        d1 = today - timedelta(days=dow); d2 = d1 + timedelta(days=6)
+                    elif "semana que viene" in t or "proxima semana" in t:
+                        dow = today.weekday(); d1 = today - timedelta(days=dow) + timedelta(days=7); d2 = d1 + timedelta(days=6)
+                    elif "semana pasada" in t:
+                        dow = today.weekday(); d2 = today - timedelta(days=dow) - timedelta(days=1); d1 = d2 - timedelta(days=6)
+                    else:
+                        # 'en 2025' o 'de 2025'
+                        m3 = _re.search(r"(?:en|de)\s+(\d{4})", t)
+                        if m3:
+                            y = int(m3.group(1)); d1 = date(y,1,1); d2 = date(y,12,31)
+
+        # Términos libres (quitar palabras comunes)
+        stop = {"ensename","muestrame","dime","consulta","ver","dame","los","las","de","del","en","la","el","por","para","sobre","desde","hasta","entre","al","a","y","o","con","sin","un","una","unos","unas","que","cuales","son"}
+        base_terms = [w for w in _re.findall(r"[a-z0-9]{3,}", t) if w not in stop]
+        excluir = {"feader","feaga","anticipo","anticipos","saldo","saldos","hoy","ayer","manana","aragon"} | set(meses.keys())
+        terms = [w for w in base_terms if w not in excluir]
+        if "aragon" in t: terms.append("aragon")
+
+        return {"d1": d1, "d2": d2, "fondo": fondo, "origins": origins, "tipo_kw": tipo_kw, "terms": terms}
 
 def main():
     root=tk.Tk()

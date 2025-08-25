@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="24d1cc2a-d654-42cd-843c-0221803a745d" name="Changes" comment="(v4.2.0 estable VERSION_beta)">
+    <list default="true" id="24d1cc2a-d654-42cd-843c-0221803a745d" name="Changes" comment="(v4.2.1 estable VERSION_beta)">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/Calendario.py" beforeDir="false" afterPath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/Calendario.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/pagos_pepac.sqlite3" beforeDir="false" afterPath="$PROJECT_DIR$/Calendario_Pagos_PEPAC-master/Calendario_Pagos_PEPAC-master/pagos_pepac.sqlite3" afterDir="false" />
@@ -34,6 +34,11 @@
     &quot;last_opened_file_path&quot;: &quot;C:/Users/ralonso/OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/DOCUMENTACIÓN FUNCIONAL/Calendario_Pagos_PEPAC-master&quot;
   }
 }</component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\ralonso\OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L\Escritorio\DOCUMENTACIÓN FUNCIONAL\Calendario_Pagos_PEPAC-master\Calendario_Pagos_PEPAC-master\Calendario_Pagos_PEPAC-master" />
+    </key>
+  </component>
   <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
   <component name="TaskManager">
     <task active="true" id="Default" summary="Default task">
@@ -83,7 +88,15 @@
       <option name="project" value="LOCAL" />
       <updated>1755863328957</updated>
     </task>
-    <option name="localTasksCounter" value="6" />
+    <task id="LOCAL-00006" summary="(v4.2.1 estable VERSION_beta)">
+      <option name="closed" value="true" />
+      <created>1756111205538</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1756111205538</updated>
+    </task>
+    <option name="localTasksCounter" value="7" />
     <servers />
   </component>
   <component name="UpdateCopyrightCheckinHandler">
@@ -106,6 +119,7 @@
     <MESSAGE value="(v4.2.0 estable VERSION)" />
     <MESSAGE value="(v4.2.0 estable VERSION_def)" />
     <MESSAGE value="(v4.2.0 estable VERSION_beta)" />
-    <option name="LAST_COMMIT_MESSAGE" value="(v4.2.0 estable VERSION_beta)" />
+    <MESSAGE value="(v4.2.1 estable VERSION_beta)" />
+    <option name="LAST_COMMIT_MESSAGE" value="(v4.2.1 estable VERSION_beta)" />
   </component>
 </project>
